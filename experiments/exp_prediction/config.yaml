@@ -1,0 +1,80 @@
+# Experiment Configuration: Baseline Prediction
+
+experiment_name: "baseline_prediction"
+description: "Baseline world model for trajectory prediction"
+
+# Data
+data:
+  train_path: "../../data/processed/episodes.npz"
+  val_path: null
+  episode_length: 30
+  max_agents: 50
+  input_dim: 6
+
+# Model Architecture
+model:
+  latent_dim: 256
+  encoder:
+    hidden_dim: 128
+    n_heads: 4
+    n_layers: 2
+    dropout: 0.1
+
+  dynamics:
+    type: "gru"  # gru, lstm, or transformer
+    hidden_dim: 512
+    n_layers: 2
+    dropout: 0.1
+
+  decoder:
+    hidden_dim: 128
+    n_layers: 2
+    dropout: 0.1
+
+# Training
+training:
+  batch_size: 32
+  n_epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.00001
+
+  # Learning rate scheduler
+  scheduler:
+    type: "cosine"  # cosine, step, plateau
+    eta_min: 0.000001
+
+  # Gradient clipping
+  max_grad_norm: 1.0
+
+  # Early stopping
+  early_stopping:
+    patience: 15
+    min_delta: 0.0001
+
+# Loss weights
+loss:
+  reconstruction: 1.0
+  prediction: 1.0
+  existence: 0.1
+  huber_delta: 1.0
+
+# Evaluation
+evaluation:
+  context_length: 10
+  rollout_length: 20
+  horizons: [1, 3, 5, 10, 20]
+
+# Logging
+logging:
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"
+  save_frequency: 10  # Save checkpoint every N epochs
+
+# Hardware
+hardware:
+  device: "cuda"  # cuda or cpu
+  num_workers: 4
+  pin_memory: true
+
+# Reproducibility
+seed: 42

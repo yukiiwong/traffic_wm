@@ -1,0 +1,95 @@
+# Improved World Model Configuration
+
+experiment_name: "improved_world_model"
+description: "Enhanced model with spatial encoding, social pooling, and extended features"
+seed: 42
+
+# Data Configuration
+data:
+  train_path: "../../data/processed/train_episodes.npz"
+  val_path: "../../data/processed/val_episodes.npz"
+  test_path: "../../data/processed/test_episodes.npz"
+  episode_length: 30
+  max_agents: 50
+  input_dim: 10  # position(2) + velocity(2) + heading(1) + type(1) + lane(1) + has_preceding(1) + has_following(1) + padding(1)
+  normalize: true
+  stats_path: null
+
+# Model Architecture
+model:
+  latent_dim: 256
+
+  # Encoder
+  encoder_hidden: 128
+  encoder_n_heads: 4
+  encoder_n_layers: 2
+  encoder_dropout: 0.1
+  use_spatial_encoding: true
+  use_social_pooling: true
+  pooling_radius: 50.0  # meters
+
+  # Dynamics
+  dynamics_type: "gru"  # gru, lstm, transformer
+  dynamics_hidden: 512
+  dynamics_n_layers: 2
+  dynamics_dropout: 0.1
+
+  # Decoder
+  decoder_hidden: 128
+  decoder_n_layers: 2
+  decoder_dropout: 0.1
+
+# Training Configuration
+training:
+  batch_size: 16
+  n_epochs: 100
+  learning_rate: 0.001
+  weight_decay: 0.00001
+
+  # Gradient clipping
+  max_grad_norm: 1.0
+
+  # Learning rate scheduler
+  scheduler_type: "cosine"  # cosine, step, plateau
+  scheduler_eta_min: 0.000001
+  scheduler_patience: 10  # for plateau scheduler
+
+  # Early stopping
+  early_stopping_patience: 20
+  early_stopping_min_delta: 0.0001
+
+  # Mixed precision training (faster on GPU)
+  use_amp: true
+  amp_dtype: "float16"
+
+  # Distributed training
+  use_ddp: false
+  world_size: 1
+  rank: 0
+
+# Loss Configuration
+loss:
+  reconstruction_weight: 1.0
+  prediction_weight: 1.0
+  existence_weight: 0.1
+  contrastive_weight: 0.05  # optional contrastive loss
+  huber_delta: 1.0
+
+# Evaluation Configuration
+evaluation:
+  context_length: 10  # use 10 seconds to predict
+  rollout_length: 20  # predict 20 seconds into future
+  horizons: [1, 3, 5, 10, 20]  # evaluation at multiple horizons
+  eval_frequency: 5  # evaluate every 5 epochs
+  save_visualizations: true
+  save_attention: true
+
+# Logging Configuration
+logging:
+  checkpoint_dir: "./checkpoints"
+  log_dir: "./logs"
+  save_frequency: 10  # save checkpoint every 10 epochs
+  use_tensorboard: false
+  use_wandb: false
+  wandb_project: null
+  wandb_entity: null
