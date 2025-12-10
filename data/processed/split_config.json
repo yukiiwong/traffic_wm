@@ -1,0 +1,218 @@
+{
+  "train": {
+    "F": [
+      "drone_4.csv",
+      "drone_7.csv",
+      "drone_10.csv",
+      "drone_17.csv",
+      "drone_16.csv",
+      "drone_14.csv",
+      "drone_13.csv",
+      "drone_3.csv",
+      "drone_12.csv",
+      "drone_11.csv",
+      "drone_8.csv",
+      "drone_1.csv",
+      "drone_9.csv"
+    ],
+    "H": [
+      "drone_4.csv",
+      "drone_5.csv",
+      "drone_11.csv",
+      "drone_16.csv",
+      "drone_18.csv",
+      "drone_9.csv",
+      "drone_6.csv",
+      "drone_2.csv",
+      "drone_15.csv",
+      "drone_12.csv",
+      "drone_14.csv",
+      "drone_7.csv",
+      "drone_8.csv",
+      "drone_17.csv"
+    ],
+    "C": [
+      "drone_8.csv",
+      "drone_4.csv",
+      "drone_9.csv",
+      "drone_16.csv",
+      "drone_13.csv",
+      "drone_12.csv",
+      "drone_15.csv",
+      "drone_11.csv",
+      "drone_10.csv",
+      "drone_18.csv",
+      "drone_6.csv",
+      "drone_2.csv",
+      "drone_17.csv",
+      "drone_14.csv",
+      "drone_1.csv"
+    ],
+    "B": [
+      "drone_2.csv",
+      "drone_10.csv",
+      "drone_15.csv",
+      "drone_20.csv",
+      "drone_1.csv",
+      "drone_3.csv",
+      "drone_17.csv",
+      "drone_8.csv",
+      "drone_13.csv",
+      "drone_18.csv",
+      "drone_4.csv",
+      "drone_19.csv",
+      "drone_16.csv",
+      "drone_14.csv",
+      "drone_5.csv",
+      "drone_7.csv",
+      "drone_6.csv"
+    ],
+    "E": [
+      "drone_18.csv",
+      "drone_1.csv",
+      "drone_12.csv",
+      "drone_7.csv",
+      "drone_16.csv",
+      "drone_15.csv",
+      "drone_2.csv",
+      "drone_10.csv",
+      "drone_3.csv",
+      "drone_13.csv",
+      "drone_14.csv",
+      "drone_11.csv",
+      "drone_8.csv",
+      "drone_17.csv",
+      "drone_6.csv"
+    ],
+    "A": [
+      "drone_7.csv",
+      "drone_8.csv",
+      "drone_4.csv",
+      "drone_18.csv",
+      "drone_11.csv",
+      "drone_3.csv",
+      "drone_15.csv",
+      "drone_13.csv",
+      "drone_2.csv",
+      "drone_1.csv",
+      "drone_14.csv",
+      "drone_16.csv",
+      "drone_17.csv",
+      "drone_5.csv",
+      "drone_12.csv",
+      "drone_9.csv"
+    ],
+    "D": [
+      "drone_18.csv",
+      "drone_12.csv",
+      "drone_4.csv",
+      "drone_2.csv",
+      "drone_17.csv",
+      "drone_3.csv",
+      "drone_16.csv",
+      "drone_13.csv",
+      "drone_8.csv",
+      "drone_14.csv",
+      "drone_5.csv",
+      "drone_11.csv",
+      "drone_7.csv"
+    ],
+    "G": [
+      "drone_9.csv",
+      "drone_13.csv",
+      "drone_4.csv",
+      "drone_12.csv",
+      "drone_7.csv",
+      "drone_8.csv",
+      "drone_17.csv",
+      "drone_1.csv",
+      "drone_10.csv",
+      "drone_15.csv",
+      "drone_18.csv",
+      "drone_16.csv",
+      "drone_6.csv",
+      "drone_5.csv",
+      "drone_3.csv",
+      "drone_11.csv"
+    ],
+    "I": [
+      "drone_1.csv",
+      "drone_13.csv",
+      "drone_6.csv",
+      "drone_5.csv",
+      "drone_2.csv",
+      "drone_8.csv",
+      "drone_10.csv",
+      "drone_3.csv",
+      "drone_11.csv"
+    ]
+  },
+  "val": {
+    "H": [
+      "drone_3.csv",
+      "drone_13.csv",
+      "drone_1.csv"
+    ],
+    "D": [
+      "drone_15.csv",
+      "drone_10.csv",
+      "drone_1.csv"
+    ],
+    "C": [
+      "drone_7.csv",
+      "drone_3.csv",
+      "drone_19.csv"
+    ],
+    "F": [
+      "drone_6.csv"
+    ],
+    "I": [
+      "drone_7.csv",
+      "drone_4.csv",
+      "drone_12.csv"
+    ],
+    "E": [
+      "drone_5.csv"
+    ],
+    "B": [
+      "drone_12.csv",
+      "drone_9.csv"
+    ]
+  },
+  "test": {
+    "A": [
+      "drone_10.csv",
+      "drone_6.csv"
+    ],
+    "C": [
+      "drone_5.csv"
+    ],
+    "H": [
+      "drone_10.csv"
+    ],
+    "F": [
+      "drone_2.csv",
+      "drone_15.csv",
+      "drone_5.csv",
+      "drone_18.csv"
+    ],
+    "G": [
+      "drone_14.csv",
+      "drone_2.csv"
+    ],
+    "E": [
+      "drone_4.csv",
+      "drone_9.csv"
+    ],
+    "D": [
+      "drone_9.csv",
+      "drone_6.csv"
+    ],
+    "I": [
+      "drone_9.csv"
+    ],
+    "B": [
+      "drone_11.csv"
+    ]
+  }
+}

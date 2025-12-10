@@ -16,8 +16,9 @@ from pathlib import Path
 import shutil
 import pandas as pd
 
-# Add src to path
-sys.path.append(str(Path(__file__).parent / 'src'))
+# Get project root and add to path
+PROJECT_ROOT = Path(__file__).parent
+sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.split_strategy import MultiSiteDataSplitter
 from src.data.preprocess import preprocess_trajectories
@@ -28,8 +29,8 @@ logger = logging.getLogger(__name__)
 
 
 def preprocess_all_sites(
-    raw_data_dir: str = "data/raw",
-    output_dir: str = "data/processed",
+    raw_data_dir: str = None,
+    output_dir: str = None,
     use_extended_features: bool = True,
     use_acceleration: bool = True,
     episode_length: int = 30,
@@ -46,8 +47,8 @@ def preprocess_all_sites(
     Preprocess all sites and split into train/val/test.
 
     Args:
-        raw_data_dir: Directory containing site folders (A-I)
-        output_dir: Output directory for processed data
+        raw_data_dir: Directory containing site folders (A-I). If None, uses project_root/data/raw
+        output_dir: Output directory for processed data. If None, uses project_root/data/processed
         use_extended_features: Use 10 features instead of 6
         use_acceleration: Include acceleration features
         episode_length: Frames per episode
@@ -60,17 +61,28 @@ def preprocess_all_sites(
         seed: Random seed for reproducibility
         save_split_config: Save split config to JSON
     """
+    # Set default paths relative to project root
+    if raw_data_dir is None:
+        raw_data_dir = PROJECT_ROOT / 'data' / 'raw'
+    else:
+        raw_data_dir = Path(raw_data_dir)
+
+    if output_dir is None:
+        output_dir = PROJECT_ROOT / 'data' / 'processed'
+    else:
+        output_dir = Path(output_dir)
+
     logger.info("=" * 60)
     logger.info("MULTI-SITE PREPROCESSING (80/10/10 SPLIT)")
     logger.info("=" * 60)
-    logger.info(f"Raw data dir: {raw_data_dir}")
-    logger.info(f"Output dir: {output_dir}")
+    logger.info(f"Raw data dir: {raw_data_dir.absolute()}")
+    logger.info(f"Output dir: {output_dir.absolute()}")
     logger.info(f"Extended features: {use_extended_features}")
     logger.info(f"Split: {train_ratio:.0%} train / {val_ratio:.0%} val / {test_ratio:.0%} test")
     logger.info("=" * 60)
 
     # Initialize splitter and get splits
-    splitter = MultiSiteDataSplitter(raw_data_dir=raw_data_dir)
+    splitter = MultiSiteDataSplitter(raw_data_dir=str(raw_data_dir))
 
     splits = splitter.split_data(
         train_ratio=train_ratio,
@@ -81,13 +93,13 @@ def preprocess_all_sites(
 
     # Save split config
     if save_split_config:
-        config_path = Path(output_dir) / "split_config.json"
+        config_path = output_dir / "split_config.json"
         splitter.save_split_config(splits, str(config_path))
 
     # Create temporary directories for each split
     temp_dirs = {}
     for split_name in ['train', 'val', 'test']:
-        temp_dir = Path(output_dir) / f"temp_{split_name}"
+        temp_dir = output_dir / f"temp_{split_name}"
         temp_dir.mkdir(parents=True, exist_ok=True)
         temp_dirs[split_name] = temp_dir
 
@@ -115,7 +127,7 @@ def preprocess_all_sites(
 
         preprocess_trajectories(
             input_dir=str(temp_dirs[split_name]),
-            output_dir=output_dir,
+            output_dir=str(output_dir),
             episode_length=episode_length,
             max_vehicles=max_vehicles,
             overlap=overlap,
@@ -127,10 +139,12 @@ def preprocess_all_sites(
         )
 
         # Rename output file
-        output_file = Path(output_dir) / "episodes.npz"
-        final_file = Path(output_dir) / f"{split_name}_episodes.npz"
+        output_file = output_dir / "episodes.npz"
+        final_file = output_dir / f"{split_name}_episodes.npz"
 
         if output_file.exists():
+            if final_file.exists():
+                final_file.unlink()
             output_file.rename(final_file)
             logger.info(f"✅ Saved to {final_file}")
 
@@ -157,10 +171,10 @@ def main():
     )
 
     # Paths
-    parser.add_argument('--raw_data_dir', type=str, default='data/raw',
-                       help='Input directory with site folders (default: data/raw)')
-    parser.add_argument('--output_dir', type=str, default='data/processed',
-                       help='Output directory (default: data/processed)')
+    parser.add_argument('--raw_data_dir', type=str, default=None,
+                       help='Input directory with site folders (default: project_root/data/raw)')
+    parser.add_argument('--output_dir', type=str, default=None,
+                       help='Output directory (default: project_root/data/processed)')
 
     # Feature configuration
     parser.add_argument('--use_extended_features', action='store_true', default=True,

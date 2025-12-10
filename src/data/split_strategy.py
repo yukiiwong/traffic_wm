@@ -24,7 +24,7 @@ class MultiSiteDataSplitter:
 
     def __init__(
         self,
-        raw_data_dir: str = "data/raw",
+        raw_data_dir: Optional[str] = None,
         sites: Optional[List[str]] = None
     ):
         """
@@ -32,9 +32,17 @@ class MultiSiteDataSplitter:
 
         Args:
             raw_data_dir: Directory containing site folders (A, B, C, ...)
+                         If None, uses project_root/data/raw
             sites: List of site names (default: A-I)
         """
-        self.raw_data_dir = Path(raw_data_dir)
+        # Get project root directory
+        if raw_data_dir is None:
+            # This file is in: project_root/src/data/split_strategy.py
+            project_root = Path(__file__).parent.parent.parent
+            self.raw_data_dir = project_root / 'data' / 'raw'
+        else:
+            self.raw_data_dir = Path(raw_data_dir)
+
         self.sites = sites or ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']
 
         # Validate sites exist
@@ -46,7 +54,10 @@ class MultiSiteDataSplitter:
             else:
                 logger.warning(f"Site {site} not found at {site_path}")
 
-        logger.info(f"Available sites: {self.available_sites}")
+        if not self.available_sites:
+            logger.error(f"No sites found in {self.raw_data_dir}")
+        else:
+            logger.info(f"Available sites: {self.available_sites}")
 
     def get_site_files(self, site: str) -> List[Path]:
         """Get all CSV files for a given site."""
@@ -83,6 +94,9 @@ class MultiSiteDataSplitter:
             site_files = self.get_site_files(site)
             all_files.extend(site_files)
             logger.info(f"Site {site}: {len(site_files)} files")
+
+        if not all_files:
+            raise ValueError(f"No CSV files found in {self.raw_data_dir}")
 
         logger.info(f"Total files: {len(all_files)}")
 
@@ -130,15 +144,21 @@ class MultiSiteDataSplitter:
     def save_split_config(
         self,
         splits: Dict[str, List[Path]],
-        output_path: str
+        output_path: Optional[str] = None
     ):
         """
         Save split configuration to JSON for reproducibility.
 
         Args:
             splits: Split dictionary
-            output_path: Path to save JSON config
+            output_path: Path to save JSON config. If None, uses project_root/data/processed/split_config.json
         """
+        if output_path is None:
+            project_root = Path(__file__).parent.parent.parent
+            output_path = project_root / 'data' / 'processed' / 'split_config.json'
+        else:
+            output_path = Path(output_path)
+
         config = {}
         for split_name, files in splits.items():
             config[split_name] = {}
@@ -150,7 +170,6 @@ class MultiSiteDataSplitter:
                     config[split_name][site] = []
                 config[split_name][site].append(filename)
 
-        output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(output_path, 'w') as f:
@@ -161,11 +180,12 @@ class MultiSiteDataSplitter:
 
 if __name__ == '__main__':
     # Example usage
-    splitter = MultiSiteDataSplitter(raw_data_dir="data/raw")
+    splitter = MultiSiteDataSplitter()
 
     print("\n" + "=" * 60)
     print("MIXED SPLIT (80/10/10)")
     print("=" * 60)
+
     splits = splitter.split_data(
         train_ratio=0.8,
         val_ratio=0.1,
@@ -174,5 +194,5 @@ if __name__ == '__main__':
     )
 
     # Save config
-    splitter.save_split_config(splits, "data/split_config.json")
-    print("\n✅ Split config saved to data/split_config.json")
+    splitter.save_split_config(splits)
+    print("\n✅ Split config saved!")
