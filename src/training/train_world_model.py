@@ -238,12 +238,23 @@ class WorldModelTrainer:
 
 def main(args):
     """Main training entry point."""
+    print("===== Experiment Config =====")
+    print(f"train_data: {args.train_data}")
+    print(f"val_data:   {args.val_data}")
+    print(f"input_dim:  {args.input_dim}")
+    print(f"latent_dim: {args.latent_dim}")
+    print(f"dynamics:   {args.dynamics_type}")
+    print(f"batch_size: {args.batch_size}")
+    print(f"n_epochs:   {args.n_epochs}")
+    print(f"lr:         {args.learning_rate}")
+    print("=============================")
     # Set seed
     set_seed(args.seed)
 
     # Device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
+
 
     # Data loaders
     train_loader = get_dataloader(
