@@ -24,10 +24,14 @@ from typing import Tuple, Optional, Dict
 
 class MultiAgentEncoder(nn.Module):
     """
-    Per-frame encoder for multi-agent states.
+    Per-frame encoder for multi-agent states（升级版，内置 spatial + social pooling）.
 
-    Takes states [B, T, K, F] and masks [B, T, K]
-    Outputs latent representations [B, T, D]
+    输入:
+        states: [B, T, K, F]
+        masks:  [B, T, K] (1=真实车辆, 0=padding)
+
+    输出:
+        latent: [B, T, D]
     """
 
     def __init__(
@@ -37,51 +41,97 @@ class MultiAgentEncoder(nn.Module):
         latent_dim: int = 256,
         n_heads: int = 4,
         n_layers: int = 2,
-        dropout: float = 0.1
+        dropout: float = 0.1,
+        # ===== 以下是“改良版”新增参数，WorldModel 不传也没关系 =====
+        use_spatial_encoding: bool = True,
+        use_social_pooling: bool = True,
+        pooling_radius: float = 50.0,
+        save_attention: bool = False,
+        # 最后一维作为 site_id（0..num_sites-1）时是否用 embedding
+        use_site_id: bool = False,
+        num_sites: int = 9,
+        site_embed_dim: int = 16,
     ):
-        """
-        Initialize multi-agent encoder.
-
-        Args:
-            input_dim: Number of features per agent (F)
-            hidden_dim: Hidden dimension for embeddings
-            latent_dim: Output latent dimension (D)
-            n_heads: Number of attention heads
-            n_layers: Number of transformer layers
-            dropout: Dropout probability
-        """
         super().__init__()
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
+        self.use_spatial_encoding = use_spatial_encoding
+        self.use_social_pooling = use_social_pooling
+        self.save_attention = save_attention
 
-        # Per-agent feature embedding
+        self.use_site_id = use_site_id
+        self.num_sites = num_sites
+        self.site_embed_dim = site_embed_dim
+
+        # ===== 1. 处理 site_id（可选） =====
+        if self.use_site_id:
+            # 约定：最后一维是 site_id，其余是连续特征
+            self.base_input_dim = input_dim - 1
+            agent_input_dim = self.base_input_dim + site_embed_dim
+            self.site_embedding = nn.Embedding(num_sites, site_embed_dim)
+        else:
+            # 不拆 site_id，所有维度直接当连续特征用
+            self.base_input_dim = input_dim
+            agent_input_dim = input_dim
+            self.site_embedding = None
+
+        # ===== 2. 每辆车的特征 MLP 嵌入 =====
         self.agent_embed = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
+            nn.Linear(agent_input_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, hidden_dim)
         )
 
-        # Transformer encoder layers
+        # ===== 3. 空间位置编码（用 (x,y)） =====
+        if self.use_spatial_encoding:
+            self.spatial_encoding = SpatialPositionalEncoding(
+                d_model=hidden_dim,
+                n_freq=10
+            )
+
+        # ===== 4. Social pooling（基于距离的局部聚合）=====
+        if self.use_social_pooling:
+            self.social_pooling = SocialPooling(
+                feature_dim=hidden_dim,
+                pooling_radius=pooling_radius,
+                use_distance_weighting=True
+            )
+            # 聚合后的特征与自身特征融合
+            self.fusion = nn.Sequential(
+                nn.Linear(hidden_dim * 2, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+
+        # ===== 5. 时间上的 Transformer（pre-norm）=====
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=n_heads,
             dim_feedforward=hidden_dim * 4,
             dropout=dropout,
-            batch_first=True
+            batch_first=True,
+            norm_first=True
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
             num_layers=n_layers
         )
 
-        # Output projection to latent space
+        # ===== 6. 映射到场景 latent =====
         self.to_latent = nn.Sequential(
             nn.Linear(hidden_dim, latent_dim),
+            nn.LayerNorm(latent_dim),
             nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(latent_dim, latent_dim)
         )
+
+        # 预留一个变量用于可视化注意力（如果你以后想 hook）
+        self.attention_weights = None
 
     def forward(
         self,
@@ -92,42 +142,72 @@ class MultiAgentEncoder(nn.Module):
         Encode multi-agent states to latent representation.
 
         Args:
-            states: [B, T, K, F] agent states
-            masks: [B, T, K] binary mask (1 = valid, 0 = padding)
+            states: [B, T, K, F]
+            masks:  [B, T, K]
 
         Returns:
-            latent: [B, T, D] latent representation per timestep
+            latent: [B, T, D]
         """
         B, T, K, F = states.shape
+        assert F == self.input_dim, f"Expected input_dim={self.input_dim}, got F={F}"
 
-        # Reshape to process all frames together
-        states_flat = states.reshape(B * T, K, F)  # [B*T, K, F]
-        masks_flat = masks.reshape(B * T, K)  # [B*T, K]
+        # 展平时间维度，按“帧”处理
+        states_flat = states.view(B * T, K, F)   # [B*T, K, F]
+        masks_flat = masks.view(B * T, K)       # [B*T, K]
 
-        # Embed each agent
-        agent_embeds = self.agent_embed(states_flat)  # [B*T, K, H]
+        # 位置用于 spatial / social（始终取前两维作为 (x, y)）
+        positions = states_flat[..., :2]        # [B*T, K, 2]
 
-        # Create attention mask (True = masked position)
+        # ===== site_id 拆分 & embedding（可选）=====
+        if self.use_site_id:
+            base_feats = states_flat[..., :self.base_input_dim]      # 连续特征
+            site_ids = states_flat[..., self.base_input_dim].long()  # [B*T, K]
+            site_ids = site_ids.clamp(min=0, max=self.num_sites - 1)
+            site_embeds = self.site_embedding(site_ids)              # [B*T, K, E]
+            agent_input = torch.cat([base_feats, site_embeds], dim=-1)  # [B*T, K, base+E]
+        else:
+            # 不用 embedding 时，所有维度原样进 MLP（包括 site_id 数值）
+            agent_input = states_flat  # [B*T, K, F]
+
+        # ===== 1. 每辆车特征嵌入 =====
+        agent_embeds = self.agent_embed(agent_input)  # [B*T, K, H]
+
+        # ===== 2. 空间位置编码 =====
+        if self.use_spatial_encoding:
+            spatial_enc = self.spatial_encoding(positions)           # [B*T, K, H]
+            agent_embeds = agent_embeds + spatial_enc
+
+        # ===== 3. Social pooling =====
+        if self.use_social_pooling:
+            pooled_features = self.social_pooling(
+                agent_embeds,  # [B*T, K, H]
+                positions,     # [B*T, K, 2]
+                masks_flat     # [B*T, K]
+            )  # 期望输出: [B*T, K, H]
+            agent_embeds = self.fusion(
+                torch.cat([agent_embeds, pooled_features], dim=-1)
+            )  # [B*T, K, H]
+
+        # ===== 4. Transformer 自注意力（在 agent 维度上）=====
+        # True = 不参与 attention
         attn_mask = (masks_flat == 0)  # [B*T, K]
 
-        # Apply transformer (with mask to ignore padding)
-        # PyTorch transformer expects [batch, seq, features]
         transformed = self.transformer(
             agent_embeds,
             src_key_padding_mask=attn_mask
         )  # [B*T, K, H]
 
-        # Aggregate across agents (masked mean pooling)
+        # （如果你以后想存 attention，可以在这里写 hook）
+
+        # ===== 5. 对 K 个 agent 做 masked mean pooling 得到“场景表示”=====
         masks_expanded = masks_flat.unsqueeze(-1)  # [B*T, K, 1]
-        masked_sum = (transformed * masks_expanded).sum(dim=1)  # [B*T, H]
-        masked_count = masks_expanded.sum(dim=1).clamp(min=1)   # [B*T, 1]
-        aggregated = masked_sum / masked_count  # [B*T, H]
+        masked_sum = (transformed * masks_expanded).sum(dim=1)   # [B*T, H]
+        masked_count = masks_expanded.sum(dim=1).clamp(min=1.0)  # [B*T, 1]
+        aggregated = masked_sum / masked_count                   # [B*T, H]
 
-        # Project to latent space
-        latent_flat = self.to_latent(aggregated)  # [B*T, D]
-
-        # Reshape back to [B, T, D]
-        latent = latent_flat.view(B, T, self.latent_dim)
+        # ===== 6. 投影到 latent 空间，并还原回 [B, T, D] =====
+        latent_flat = self.to_latent(aggregated)                 # [B*T, D]
+        latent = latent_flat.view(B, T, self.latent_dim)         # [B, T, D]
 
         return latent
 

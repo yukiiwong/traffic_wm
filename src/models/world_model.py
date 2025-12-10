@@ -63,7 +63,8 @@ class WorldModel(nn.Module):
             hidden_dim=encoder_hidden,
             latent_dim=latent_dim,
             n_layers=n_encoder_layers,
-            dropout=dropout
+            dropout=dropout,
+            use_site_id=True,
         )
 
         # Dynamics: latent -> next_latent

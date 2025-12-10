@@ -140,6 +140,13 @@ desktop.ini
 .env.local
 
 # ======================
+# CLAUDE CODE
+# ======================
+# Claude Code instructions (local only)
+CLAUDE.md
+.claude/
+
+# ======================
 # JUPYTER
 # ======================
 *.ipynb_checkpoints
@@ -153,3 +160,4 @@ desktop.ini
 *.tar.gz
 *.rar
 *.7z
+nul

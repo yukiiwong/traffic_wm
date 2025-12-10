@@ -104,6 +104,47 @@ def encode_lane(lane_str: str, lane_mapping: Dict[str, int]) -> int:
 
     return lane_mapping[lane_str]
 
+def get_site_id_from_frames(df: pd.DataFrame, frames: List[int]) -> int:
+    """
+    Derive a numeric site_id (0,1,2,...) from the 'site' column.
+
+    Convention:
+      - If site is like 'A', 'B', ..., 'I'  -> A=0, B=1, ...
+      - If site is like 'Site A'           -> A=0, B=1, ...
+      - Otherwise                          -> 0 (default)
+
+    Args:
+        df: Full trajectory DataFrame (must contain 'site' if used)
+        frames: Frames belonging to this episode (for robustness)
+
+    Returns:
+        Integer site_id in [0, ...]
+    """
+    if 'site' not in df.columns:
+        return 0
+
+    # Prefer frames within this episode; fallback to whole df if empty
+    df_sub = df[df['frame'].isin(frames)]
+    if len(df_sub) == 0:
+        df_sub = df
+
+    if len(df_sub) == 0:
+        return 0
+
+    raw = str(df_sub['site'].iloc[0]).strip()
+
+    # Case 1: single letter 'A'...'Z'
+    if len(raw) == 1 and raw.isalpha():
+        return max(0, ord(raw.upper()) - ord('A'))
+
+    # Case 2: 'Site A', 'site B', etc.
+    parts = raw.split()
+    last = parts[-1]
+    if len(last) == 1 and last.isalpha():
+        return max(0, ord(last.upper()) - ord('A'))
+
+    # Fallback
+    return 0
 
 def extract_episodes(
     df: pd.DataFrame,
@@ -111,8 +152,10 @@ def extract_episodes(
     max_vehicles: int = 50,
     overlap: int = 0,
     use_extended_features: bool = False,
-    use_acceleration: bool = False
+    use_acceleration: bool = False,
+    use_site_id: bool = False,
 ) -> List[Dict[str, np.ndarray]]:
+
     """
     Extract fixed-length episodes from trajectory data.
 
@@ -137,8 +180,12 @@ def extract_episodes(
                           desc="Extracting episodes"):
         episode_frames = frames[start_idx:start_idx + episode_length]
         episode_data = extract_single_episode(
-            df, episode_frames, max_vehicles,
-            use_extended_features, use_acceleration
+            df,
+            episode_frames,
+            max_vehicles,
+            use_extended_features=use_extended_features,
+            use_acceleration=use_acceleration,
+            use_site_id=use_site_id,
         )
         episodes.append(episode_data)
 
@@ -150,8 +197,10 @@ def extract_single_episode(
     frames: List[int],
     max_vehicles: int,
     use_extended_features: bool = False,
-    use_acceleration: bool = False
+    use_acceleration: bool = False,
+    use_site_id: bool = False,
 ) -> Dict[str, np.ndarray]:
+
     """
     Extract a single episode for the given frames.
 
@@ -161,11 +210,14 @@ def extract_single_episode(
         max_vehicles: Maximum number of vehicles (K)
         use_extended_features: Include extended features
         use_acceleration: Include acceleration
+        use_site_id: Include site_id as an extra feature dimension (last feature)
 
     Returns:
         Dictionary with 'states', 'masks', 'scene_id', etc.
     """
     T = len(frames)
+    # Derive a scene-level site_id (used as both scene_id and per-vehicle feature if enabled)
+    site_id = get_site_id_from_frames(df, frames)
 
     # Determine number of features
     F = 6  # Basic: x, y, vx, vy, angle, type
@@ -175,7 +227,9 @@ def extract_single_episode(
         F += 3  # lane, has_preceding, has_following
         if F < 10:  # Ensure at least 10 features for extended mode
             F = 10
-
+    # Add one extra dim for site_id if enabled
+    if use_site_id:
+        F += 1
     states = np.zeros((T, max_vehicles, F), dtype=np.float32)
     masks = np.zeros((T, max_vehicles), dtype=np.float32)
     track_ids = np.zeros((T, max_vehicles), dtype=np.int32)
@@ -233,13 +287,15 @@ def extract_single_episode(
             # Store track IDs
             track_ids[t, :n_vehicles] = frame_data['track_id'].values[:n_vehicles]
             masks[t, :n_vehicles] = 1.0
+            # Site feature (if enabled) — use the same site_id for all vehicles in this episode
+            if use_site_id:
+                # feature_idx currently points to the next free feature slot
+                states[t, :n_vehicles, feature_idx] = float(site_id)
+                feature_idx += 1
 
     # Extract scene_id from site column
-    if 'site' in df.columns:
-        site_value = df[df['frame'].isin(frames)]['site'].iloc[0] if len(df[df['frame'].isin(frames)]) > 0 else 'Site A'
-        scene_id = ord(str(site_value).split()[-1]) - ord('A') if 'Site' in str(site_value) else 0
-    else:
-        scene_id = 0
+    # Use the derived site_id as scene_id for this episode
+    scene_id = site_id
 
     return {
         'states': states,
@@ -331,12 +387,14 @@ def preprocess_trajectories(
     fps: float = 30.0,
     use_extended_features: bool = False,
     use_acceleration: bool = False,
+    use_site_id: bool = False,
     split_data: bool = False,
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
     test_ratio: float = 0.15,
     save_metadata: bool = True
 ) -> None:
+
     """
     Main preprocessing pipeline: CSV -> Episodes -> NPZ files.
 
@@ -354,6 +412,8 @@ def preprocess_trajectories(
         val_ratio: Validation set ratio
         test_ratio: Test set ratio
         save_metadata: Whether to save metadata JSON
+        use_site_id: Include site_id as an extra feature dimension
+
     """
     input_path = Path(input_dir)
     output_path = Path(output_dir)
@@ -400,8 +460,10 @@ def preprocess_trajectories(
             max_vehicles=max_vehicles,
             overlap=overlap,
             use_extended_features=use_extended_features,
-            use_acceleration=use_acceleration
+            use_acceleration=use_acceleration,
+            use_site_id=use_site_id,
         )
+
 
         all_episodes.extend(episodes)
         logger.info(f"  Extracted {len(episodes)} episodes")
@@ -469,7 +531,9 @@ def preprocess_trajectories(
         if use_acceleration:
             F += 2
         if use_extended_features:
-            F = max(F, 10)
+            F = max(F + 3, 10)  # base + lane/preceding/following, at least 10
+        if use_site_id:
+            F += 1  # Extra dim for site_id
 
         metadata = {
             'n_episodes': len(all_episodes),
@@ -480,9 +544,11 @@ def preprocess_trajectories(
             'dt': dt,
             'use_extended_features': use_extended_features,
             'use_acceleration': use_acceleration,
+            'use_site_id': use_site_id,
             'lane_mapping': lane_mapping if use_extended_features else {},
             'statistics': stats
         }
+
 
         with open(output_path / 'metadata.json', 'w') as f:
             json.dump(metadata, f, indent=2)

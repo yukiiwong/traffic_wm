@@ -41,8 +41,10 @@ def preprocess_all_sites(
     val_ratio: float = 0.1,
     test_ratio: float = 0.1,
     seed: int = 42,
-    save_split_config: bool = True
+    save_split_config: bool = True,
+    use_site_id: bool = True,
 ):
+
     """
     Preprocess all sites and split into train/val/test.
 
@@ -60,6 +62,7 @@ def preprocess_all_sites(
         test_ratio: Test ratio (default: 0.1)
         seed: Random seed for reproducibility
         save_split_config: Save split config to JSON
+        use_site_id: Whether to add site_id as an extra feature dimension (default: True)
     """
     # Set default paths relative to project root
     if raw_data_dir is None:
@@ -107,12 +110,10 @@ def preprocess_all_sites(
         for file_path in splits[split_name]:
             dest_path = temp_dir / f"{file_path.parent.name}_{file_path.name}"
 
-            # Read and add site column if not present
+            # ✅ 统一 site 列：始终使用文件夹名 ('A'...'I') 作为站点标识
             df = pd.read_csv(file_path)
-            if 'site' not in df.columns:
-                site_name = file_path.parent.name
-                df['site'] = f"Site {site_name}"
-
+            site_name = file_path.parent.name  # 例如 'A'
+            df['site'] = site_name  # 直接覆盖/写入
             df.to_csv(dest_path, index=False)
 
         logger.info(f"Prepared {len(splits[split_name])} files for {split_name}")
@@ -134,6 +135,7 @@ def preprocess_all_sites(
             fps=fps,
             use_extended_features=use_extended_features,
             use_acceleration=use_acceleration,
+            use_site_id=use_site_id,
             split_data=False,  # We're already splitting
             save_metadata=(split_name == 'train')  # Only save metadata once
         )
@@ -189,8 +191,8 @@ def main():
                        help='Max vehicles per frame (default: 50)')
     parser.add_argument('--overlap', type=int, default=5,
                        help='Frame overlap between episodes (default: 5)')
-    parser.add_argument('--fps', type=float, default=30.0,
-                       help='Frames per second (default: 30.0)')
+    parser.add_argument('--fps', type=float, default=1.0,
+                       help='Frames per second (default: 1.0)')
 
     # Split ratios
     parser.add_argument('--train_ratio', type=float, default=0.8,
