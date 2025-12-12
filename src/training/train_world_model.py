@@ -161,12 +161,24 @@ class WorldModelTrainer:
         return total_losses
 
     def save_checkpoint(self, name: str = 'checkpoint.pt'):
-        """Save model checkpoint."""
+        """Save model checkpoint with normalization stats."""
+        # Get normalization stats from training dataset
+        train_mean = None
+        train_std = None
+        if hasattr(self.train_loader.dataset, 'mean') and hasattr(self.train_loader.dataset, 'std'):
+            train_mean = self.train_loader.dataset.mean.cpu().numpy().tolist()
+            train_std = self.train_loader.dataset.std.cpu().numpy().tolist()
+
         checkpoint = {
             'epoch': self.epoch,
             'global_step': self.global_step,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            # ✅ 新增：保存归一化统计
+            'normalization': {
+                'mean': train_mean,
+                'std': train_std
+            }
         }
 
         if self.scheduler is not None:
@@ -175,6 +187,8 @@ class WorldModelTrainer:
         save_path = self.checkpoint_dir / name
         torch.save(checkpoint, save_path)
         self.logger.info(f"Saved checkpoint to {save_path}")
+        if train_mean is not None:
+            self.logger.info(f"  ✅ Saved normalization stats (mean[:2]={train_mean[:2]})")
 
     def load_checkpoint(self, path: str):
         """Load model checkpoint."""

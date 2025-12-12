@@ -178,6 +178,67 @@ class MultiSiteDataSplitter:
         logger.info(f"Split config saved to {output_path}")
 
 
+def chronological_split_episodes(
+    episodes: List[Dict],
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15
+) -> Dict[str, List[Dict]]:
+    """
+    Split episodes chronologically (time-based) to prevent temporal leakage.
+
+    Episodes are sorted by their start time, then split sequentially:
+    - First train_ratio portion -> train
+    - Next val_ratio portion -> val
+    - Last test_ratio portion -> test
+
+    Args:
+        episodes: List of episode dictionaries (must contain 'episode_start_global_frame')
+        train_ratio: Training ratio (default: 0.7)
+        val_ratio: Validation ratio (default: 0.15)
+        test_ratio: Test ratio (default: 0.15)
+
+    Returns:
+        Dictionary with 'train', 'val', 'test' keys mapping to episode lists
+    """
+    assert abs(train_ratio + val_ratio + test_ratio - 1.0) < 1e-6, \
+        "Ratios must sum to 1.0"
+
+    # Sort episodes by start time
+    sorted_episodes = sorted(
+        episodes,
+        key=lambda ep: ep.get('episode_start_global_frame', ep.get('start_frame', 0))
+    )
+
+    n_total = len(sorted_episodes)
+    n_train = int(n_total * train_ratio)
+    n_val = int(n_total * val_ratio)
+
+    splits = {
+        'train': sorted_episodes[:n_train],
+        'val': sorted_episodes[n_train:n_train + n_val],
+        'test': sorted_episodes[n_train + n_val:]
+    }
+
+    logger.info("=" * 60)
+    logger.info("Chronological Split Summary:")
+    logger.info("=" * 60)
+    for split_name in ['train', 'val', 'test']:
+        eps = splits[split_name]
+        if len(eps) > 0:
+            start_frame = min(ep.get('episode_start_global_frame', ep.get('start_frame', 0))
+                            for ep in eps)
+            end_frame = max(ep.get('episode_end_global_frame', ep.get('end_frame', 0))
+                          for ep in eps)
+            logger.info(f"{split_name.upper()}: {len(eps)} episodes, "
+                       f"frames {start_frame}-{end_frame}")
+        else:
+            logger.info(f"{split_name.upper()}: {len(eps)} episodes")
+    logger.info("=" * 60)
+
+    return splits
+
+
 if __name__ == '__main__':
     # Example usage
     splitter = MultiSiteDataSplitter()

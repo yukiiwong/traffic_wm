@@ -42,7 +42,7 @@ class MultiAgentEncoder(nn.Module):
         n_heads: int = 4,
         n_layers: int = 2,
         dropout: float = 0.1,
-        # ===== 以下是“改良版”新增参数，WorldModel 不传也没关系 =====
+        # ===== 以下是"改良版"新增参数，WorldModel 不传也没关系 =====
         use_spatial_encoding: bool = True,
         use_social_pooling: bool = True,
         pooling_radius: float = 50.0,
@@ -51,6 +51,11 @@ class MultiAgentEncoder(nn.Module):
         use_site_id: bool = False,
         num_sites: int = 9,
         site_embed_dim: int = 16,
+        # Lane embedding support (for extended features)
+        use_lane_embedding: bool = False,
+        num_lanes: int = 200,
+        lane_embed_dim: int = 16,
+        lane_feature_idx: int = 8,  # Default: lane_id is at index 8 in extended features
     ):
         super().__init__()
 
@@ -65,17 +70,41 @@ class MultiAgentEncoder(nn.Module):
         self.num_sites = num_sites
         self.site_embed_dim = site_embed_dim
 
-        # ===== 1. 处理 site_id（可选） =====
+        self.use_lane_embedding = use_lane_embedding
+        self.num_lanes = num_lanes
+        self.lane_embed_dim = lane_embed_dim
+        self.lane_feature_idx = lane_feature_idx
+
+        # ===== 1. 处理 site_id 和 lane_id embeddings（可选） =====
+        # Count how many dimensions to exclude from continuous features
+        dims_to_exclude = 0
+        embed_dim_total = 0
+
+        # Site ID embedding
         if self.use_site_id:
-            # 约定：最后一维是 site_id，其余是连续特征
-            self.base_input_dim = input_dim - 1
-            agent_input_dim = self.base_input_dim + site_embed_dim
+            dims_to_exclude += 1
+            embed_dim_total += site_embed_dim
             self.site_embedding = nn.Embedding(num_sites, site_embed_dim)
         else:
-            # 不拆 site_id，所有维度直接当连续特征用
+            self.site_embedding = None
+
+        # Lane embedding
+        if self.use_lane_embedding:
+            dims_to_exclude += 1
+            embed_dim_total += lane_embed_dim
+            self.lane_embedding = nn.Embedding(num_lanes, lane_embed_dim)
+        else:
+            self.lane_embedding = None
+
+        # Calculate agent input dimension
+        if dims_to_exclude > 0:
+            # Exclude discrete features and add their embeddings
+            self.base_input_dim = input_dim - dims_to_exclude
+            agent_input_dim = self.base_input_dim + embed_dim_total
+        else:
+            # No embeddings, use all features as continuous
             self.base_input_dim = input_dim
             agent_input_dim = input_dim
-            self.site_embedding = None
 
         # ===== 2. 每辆车的特征 MLP 嵌入 =====
         self.agent_embed = nn.Sequential(
@@ -158,15 +187,41 @@ class MultiAgentEncoder(nn.Module):
         # 位置用于 spatial / social（始终取前两维作为 (x, y)）
         positions = states_flat[..., :2]        # [B*T, K, 2]
 
-        # ===== site_id 拆分 & embedding（可选）=====
+        # ===== Extract discrete features and create embeddings =====
+        embeddings = []
+        continuous_indices = list(range(F))
+
+        # Handle lane embedding
+        if self.use_lane_embedding:
+            lane_ids = states_flat[..., self.lane_feature_idx].long()  # [B*T, K]
+            lane_ids = lane_ids.clamp(min=0, max=self.num_lanes - 1)
+            lane_embeds = self.lane_embedding(lane_ids)  # [B*T, K, lane_embed_dim]
+            embeddings.append(lane_embeds)
+            # Remove lane index from continuous features
+            if self.lane_feature_idx in continuous_indices:
+                continuous_indices.remove(self.lane_feature_idx)
+
+        # Handle site embedding (assume site_id is the last dimension if used)
         if self.use_site_id:
-            base_feats = states_flat[..., :self.base_input_dim]      # 连续特征
-            site_ids = states_flat[..., self.base_input_dim].long()  # [B*T, K]
+            site_id_idx = F - 1  # Last dimension
+            site_ids = states_flat[..., site_id_idx].long()  # [B*T, K]
             site_ids = site_ids.clamp(min=0, max=self.num_sites - 1)
-            site_embeds = self.site_embedding(site_ids)              # [B*T, K, E]
-            agent_input = torch.cat([base_feats, site_embeds], dim=-1)  # [B*T, K, base+E]
+            site_embeds = self.site_embedding(site_ids)  # [B*T, K, site_embed_dim]
+            embeddings.append(site_embeds)
+            # Remove site index from continuous features
+            if site_id_idx in continuous_indices:
+                continuous_indices.remove(site_id_idx)
+
+        # Extract continuous features (excluding discrete ones)
+        if len(embeddings) > 0:
+            # Use only continuous features
+            continuous_feats = torch.index_select(
+                states_flat, dim=-1, index=torch.tensor(continuous_indices, device=states_flat.device)
+            )  # [B*T, K, n_continuous]
+            # Concatenate continuous features with embeddings
+            agent_input = torch.cat([continuous_feats] + embeddings, dim=-1)
         else:
-            # 不用 embedding 时，所有维度原样进 MLP（包括 site_id 数值）
+            # No embeddings, use all features as continuous
             agent_input = states_flat  # [B*T, K, F]
 
         # ===== 1. 每辆车特征嵌入 =====
