@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ========= 基本路径设置 =========
+# 避免显存碎片导致的 OOM
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
+# ====== 路径设置 ======
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$PROJECT_ROOT"
 
@@ -15,31 +18,38 @@ CKPT_DIR="checkpoints/world_model"
 
 mkdir -p "$LOG_DIR" "$CKPT_DIR"
 
-# ========= 固定参数（可以按需改） =========
-INPUT_DIM=11              # 和 metadata.json 里的 n_features 一致
-BATCH_SIZE=128
+# ====== GPU 设置（这里用 0 和 1 两块卡）======
+GPU_IDS=(0 1)                    # 可用 GPU 列表
+NUM_GPUS=${#GPU_IDS[@]}          # GPU 数量
+MAX_JOBS=$NUM_GPUS               # 同时最多跑几个实验（这里 = GPU 数）
+
+JOB_IDX=0                        # 实验计数器，用于轮流分配 GPU
+
+# ====== 从 metadata.json 自动读取 input_dim ======
+INPUT_DIM=$(python - << 'PY'
+import json
+with open("data/processed/metadata.json") as f:
+    meta = json.load(f)
+print(meta["n_features"])
+PY
+)
+
+echo "Detected INPUT_DIM from metadata.json: ${INPUT_DIM}"
+
+# ====== 固定训练超参（按需修改） ======
+BATCH_SIZE=128          # 稍微保守，防止 OOM；你可以试着改回 128
 N_EPOCHS=200
 LR=3e-4
 
-ENCODER_HIDDEN=128
-DYNAMICS_HIDDEN=512
-LATENT_DIMS=(256 512)     # 对比两个 latent dim
+LATENT_DIMS=(256 512)                 # 对比两种 latent_dim
+DYNAMICS_TYPES=("gru" "lstm" "transformer")  # 三种 dynamics
+SEEDS=(1 2 3)                         # 多随机种子
 
-# 支持的 dynamics_type：gru / lstm / transformer
-DYNAMICS_TYPES=("gru" "lstm" "transformer")
-
-# 多随机种子（可选）
-SEEDS=(1 2 3)
-
-# 控制并行数（比如同时跑 3 个实验，如果你想全部串行，就设成 1）
-MAX_JOBS=3
-
-# ========= 一个小函数：限制并行任务数 =========
+# ====== 并行控制：限制后台任务数 ======
 wait_for_free_slot() {
   while true; do
-    # 统计当前后台运行的任务数
     local njobs
-    njobs=$(jobs -r | wc -l)
+    njobs=$(jobs -r | wc -l)   # 当前正在运行的后台任务数
     if (( njobs < MAX_JOBS )); then
       break
     fi
@@ -47,7 +57,7 @@ wait_for_free_slot() {
   done
 }
 
-# ========= 主循环：扫所有组合 =========
+# ====== 主循环：扫所有组合，并轮流分配到不同 GPU ======
 for dyn in "${DYNAMICS_TYPES[@]}"; do
   for latent in "${LATENT_DIMS[@]}"; do
     for seed in "${SEEDS[@]}"; do
@@ -62,28 +72,32 @@ for dyn in "${DYNAMICS_TYPES[@]}"; do
       echo "  logs:   ${LOG_FILE}"
       echo "  ckpt:   ${CKPT_SUBDIR}"
 
+      # 等待有空闲“槽位”（不超过 MAX_JOBS 个并行任务）
       wait_for_free_slot
 
-      CUDA_VISIBLE_DEVICES=0 \
-      python "$TRAIN_SCRIPT" \
-        --train_data "$TRAIN_DATA" \
-        --val_data   "$VAL_DATA" \
-        --input_dim  "$INPUT_DIM" \
-        --latent_dim "$latent" \
-        --encoder_hidden  "$ENCODER_HIDDEN" \
-        --dynamics_hidden "$DYNAMICS_HIDDEN" \
-        --dynamics_type   "$dyn" \
-        --batch_size  "$BATCH_SIZE" \
-        --n_epochs    "$N_EPOCHS" \
-        --learning_rate "$LR" \
-        --seed        "$seed" \
-        --output_dir  "$CKPT_SUBDIR" \
-        >"$LOG_FILE" 2>&1 &
+      # 轮流选择 GPU：0,1,0,1,...
+      GPU_ID=${GPU_IDS[$(( JOB_IDX % NUM_GPUS ))]}
+      JOB_IDX=$(( JOB_IDX + 1 ))
+      echo "  using GPU: ${GPU_ID}"
 
-      # 去掉上面的 & 则改为串行运行
+      # 启动训练（放到后台跑，输出写入 log）
+      CUDA_VISIBLE_DEVICES=${GPU_ID} \
+      python "$TRAIN_SCRIPT" \
+        --train_data     "$TRAIN_DATA" \
+        --val_data       "$VAL_DATA" \
+        --input_dim      "$INPUT_DIM" \
+        --latent_dim     "$latent" \
+        --dynamics_type  "$dyn" \
+        --batch_size     "$BATCH_SIZE" \
+        --n_epochs       "$N_EPOCHS" \
+        --learning_rate  "$LR" \
+        --seed           "$seed" \
+        --checkpoint_dir "$CKPT_SUBDIR" \
+        --log_dir        "$CKPT_SUBDIR" \
+        >"$LOG_FILE" 2>&1 &
 
     done
   done
 done
 
-echo "🎉 All experiments submitted. Use 'jobs -l' to check running status."
+echo "🎉 All experiments submitted. Use 'nvidia-smi' to monitor GPUs, and 'tail -f logs/world_model/xxx.log' to watch training."

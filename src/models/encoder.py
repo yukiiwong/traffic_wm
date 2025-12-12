@@ -152,8 +152,8 @@ class MultiAgentEncoder(nn.Module):
         assert F == self.input_dim, f"Expected input_dim={self.input_dim}, got F={F}"
 
         # 展平时间维度，按“帧”处理
-        states_flat = states.view(B * T, K, F)   # [B*T, K, F]
-        masks_flat = masks.view(B * T, K)       # [B*T, K]
+        states_flat = states.reshape(B * T, K, F)   # [B*T, K, F]
+        masks_flat = masks.reshape(B * T, K)       # [B*T, K]
 
         # 位置用于 spatial / social（始终取前两维作为 (x, y)）
         positions = states_flat[..., :2]        # [B*T, K, 2]
