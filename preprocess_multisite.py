@@ -45,6 +45,7 @@ def preprocess_all_sites(
     save_split_config: bool = True,
     use_site_id: bool = True,
     use_chronological_split: bool = True,
+    sites: list = None,
 ):
     """
     Preprocess all sites using improved pipeline with global timeline.
@@ -71,6 +72,7 @@ def preprocess_all_sites(
         save_split_config: Save split config to JSON
         use_site_id: Whether to add site_id as an extra feature dimension (default: True)
         use_chronological_split: Use time-based split (default: True)
+        sites: List of site names to process (e.g., ['A', 'B']). If None, processes all available sites
     """
     # Set default paths relative to project root
     if raw_data_dir is None:
@@ -100,14 +102,26 @@ def preprocess_all_sites(
     logger.info("=" * 60)
 
     # Get available sites
-    sites = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']
-    available_sites = [s for s in sites if (raw_data_dir / s).exists()]
+    all_sites = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I']
+
+    # Filter by requested sites if specified
+    if sites is not None:
+        # Convert to uppercase and filter
+        requested_sites = [s.upper() for s in sites]
+        available_sites = [s for s in requested_sites if (raw_data_dir / s).exists()]
+        missing_sites = [s for s in requested_sites if s not in available_sites]
+
+        if missing_sites:
+            logger.warning(f"Requested sites not found: {missing_sites}")
+    else:
+        # Process all available sites
+        available_sites = [s for s in all_sites if (raw_data_dir / s).exists()]
 
     if not available_sites:
         logger.error(f"No site folders found in {raw_data_dir}")
         return
 
-    logger.info(f"Found sites: {available_sites}")
+    logger.info(f"Processing sites: {available_sites}")
 
     # Process each site with split-aware episode extraction to avoid overlap
     # This implements "Scheme A" from IMPROVEMENTS_todo.md:
@@ -430,6 +444,10 @@ def main():
                        action='store_false',
                        help='Use random split instead of chronological')
 
+    # Site selection
+    parser.add_argument('--sites', type=str, nargs='+', default=None,
+                       help='Specific sites to process (e.g., A B C). If not specified, processes all available sites')
+
     # Other
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed (default: 42)')
@@ -452,7 +470,8 @@ def main():
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
         save_split_config=not args.no_save_split_config,
-        use_chronological_split=args.use_chronological_split
+        use_chronological_split=args.use_chronological_split,
+        sites=args.sites
     )
 
 
