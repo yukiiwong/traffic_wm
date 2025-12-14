@@ -22,9 +22,9 @@ import torch.optim as optim
 from torch.nn.utils import clip_grad_norm_
 from tqdm import tqdm
 
-from dataset import get_dataloader
-from world_model import WorldModel
-from losses import WorldModelLoss
+from src.data.dataset import get_dataloader
+from src.models.world_model import WorldModel
+from src.training.losses import WorldModelLoss
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,12 +33,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--val_data", type=str, required=True, help="Path to val_episodes.npz")
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints/world_model")
 
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--epochs", "--n_epochs", type=int, default=50, dest="epochs")
     p.add_argument("--batch_size", type=int, default=16)
     p.add_argument("--num_workers", type=int, default=4)
-    p.add_argument("--lr", type=float, default=3e-4)
+    p.add_argument("--lr", "--learning_rate", type=float, default=3e-4, dest="lr")
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
+
+    # loss weights
+    p.add_argument("--recon_weight", type=float, default=1.0)
+    p.add_argument("--pred_weight", type=float, default=1.0)
+    p.add_argument("--existence_weight", type=float, default=0.1)
+
+    # logging
+    p.add_argument("--log_dir", type=str, default="logs/world_model")
 
     # model dims
     p.add_argument("--input_dim", type=int, default=12)
@@ -147,9 +155,9 @@ def main() -> None:
     )
 
     loss_fn = WorldModelLoss(
-        recon_weight=1.0,
-        pred_weight=1.0,
-        exist_weight=0.1,
+        recon_weight=args.recon_weight,
+        pred_weight=args.pred_weight,
+        exist_weight=args.existence_weight,
         huber_beta=1.0,
         continuous_indices=train_loader.dataset.continuous_indices,
         use_pred_existence_loss=True,

@@ -19,9 +19,9 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional, Tuple, List
 
-from encoder import MultiAgentEncoder
-from dynamics import LatentDynamics
-from decoder import StateDecoder
+from src.models.encoder import MultiAgentEncoder
+from src.models.dynamics import LatentDynamics
+from src.models.decoder import StateDecoder
 
 
 class WorldModel(nn.Module):
