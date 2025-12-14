@@ -1,848 +1,176 @@
 """
-Multi-Agent Encoder
+Multi-Agent Encoder (per-frame agent interaction encoder)
 
-Provides multiple encoder architectures for multi-agent trajectory modeling:
-- MultiAgentEncoder: Transformer-based encoder with attention mechanism
-- SimpleMLPEncoder: Baseline MLP encoder with mean pooling
-- ImprovedMultiAgentEncoder: Enhanced with spatial encoding and social pooling
-- RelativePositionEncoder: Graph-based encoder with pairwise relations
-
-Features:
-- Spatial positional encoding for continuous (x, y) positions
-- Social pooling for local interaction modeling
-- Relative position encoding between vehicles
-- Attention weight visualization hooks
-- Support for different attention patterns
+- Projects continuous features with an MLP
+- Embeds discrete IDs (lane_id / class_id / site_id) with embeddings
+- Applies a TransformerEncoder over agents for each time step
+- Pools over agents (masked mean) to produce a scene latent per time step: [B, T, D]
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import math
-from typing import Tuple, Optional, Dict
+from typing import List, Optional
 
 
 class MultiAgentEncoder(nn.Module):
-    """
-    Per-frame encoder for multi-agent states（升级版，内置 spatial + social pooling）.
-
-    输入:
-        states: [B, T, K, F]
-        masks:  [B, T, K] (1=真实车辆, 0=padding)
-
-    输出:
-        latent: [B, T, D]
-    """
-
     def __init__(
         self,
-        input_dim: int = 6,
-        hidden_dim: int = 128,
-        latent_dim: int = 256,
-        n_heads: int = 4,
-        n_layers: int = 2,
-        dropout: float = 0.1,
-        # ===== 以下是"改良版"新增参数，WorldModel 不传也没关系 =====
-        use_spatial_encoding: bool = True,
-        use_social_pooling: bool = True,
-        pooling_radius: float = 50.0,
-        save_attention: bool = False,
-        # 最后一维作为 site_id（0..num_sites-1）时是否用 embedding
-        use_site_id: bool = False,
-        num_sites: int = 9,
-        site_embed_dim: int = 16,
-        # Lane embedding support (for extended features)
-        use_lane_embedding: bool = False,
-        num_lanes: int = 200,
-        lane_embed_dim: int = 16,
-        lane_feature_idx: int = 8,  # Default: lane_id is at index 8 in extended features
-    ):
-        super().__init__()
-
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.latent_dim = latent_dim
-        self.use_spatial_encoding = use_spatial_encoding
-        self.use_social_pooling = use_social_pooling
-        self.save_attention = save_attention
-
-        self.use_site_id = use_site_id
-        self.num_sites = num_sites
-        self.site_embed_dim = site_embed_dim
-
-        self.use_lane_embedding = use_lane_embedding
-        self.num_lanes = num_lanes
-        self.lane_embed_dim = lane_embed_dim
-        self.lane_feature_idx = lane_feature_idx
-
-        # ===== 1. 处理 site_id 和 lane_id embeddings（可选） =====
-        # Count how many dimensions to exclude from continuous features
-        dims_to_exclude = 0
-        embed_dim_total = 0
-
-        # Site ID embedding
-        if self.use_site_id:
-            dims_to_exclude += 1
-            embed_dim_total += site_embed_dim
-            self.site_embedding = nn.Embedding(num_sites, site_embed_dim)
-        else:
-            self.site_embedding = None
-
-        # Lane embedding
-        if self.use_lane_embedding:
-            dims_to_exclude += 1
-            embed_dim_total += lane_embed_dim
-            self.lane_embedding = nn.Embedding(num_lanes, lane_embed_dim)
-        else:
-            self.lane_embedding = None
-
-        # Calculate agent input dimension
-        if dims_to_exclude > 0:
-            # Exclude discrete features and add their embeddings
-            self.base_input_dim = input_dim - dims_to_exclude
-            agent_input_dim = self.base_input_dim + embed_dim_total
-        else:
-            # No embeddings, use all features as continuous
-            self.base_input_dim = input_dim
-            agent_input_dim = input_dim
-
-        # ===== 2. 每辆车的特征 MLP 嵌入 =====
-        self.agent_embed = nn.Sequential(
-            nn.Linear(agent_input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-
-        # ===== 3. 空间位置编码（用 (x,y)） =====
-        if self.use_spatial_encoding:
-            self.spatial_encoding = SpatialPositionalEncoding(
-                d_model=hidden_dim,
-                n_freq=10
-            )
-
-        # ===== 4. Social pooling（基于距离的局部聚合）=====
-        if self.use_social_pooling:
-            self.social_pooling = SocialPooling(
-                feature_dim=hidden_dim,
-                pooling_radius=pooling_radius,
-                use_distance_weighting=True
-            )
-            # 聚合后的特征与自身特征融合
-            self.fusion = nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout)
-            )
-
-        # ===== 5. 时间上的 Transformer（pre-norm）=====
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=n_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=n_layers
-        )
-
-        # ===== 6. 映射到场景 latent =====
-        self.to_latent = nn.Sequential(
-            nn.Linear(hidden_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(latent_dim, latent_dim)
-        )
-
-        # 预留一个变量用于可视化注意力（如果你以后想 hook）
-        self.attention_weights = None
-
-    def forward(
-        self,
-        states: torch.Tensor,
-        masks: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Encode multi-agent states to latent representation.
-
-        Args:
-            states: [B, T, K, F]
-            masks:  [B, T, K]
-
-        Returns:
-            latent: [B, T, D]
-        """
-        B, T, K, F = states.shape
-        assert F == self.input_dim, f"Expected input_dim={self.input_dim}, got F={F}"
-
-        # 展平时间维度，按“帧”处理
-        states_flat = states.reshape(B * T, K, F)   # [B*T, K, F]
-        masks_flat = masks.reshape(B * T, K)       # [B*T, K]
-
-        # 位置用于 spatial / social（始终取前两维作为 (x, y)）
-        positions = states_flat[..., :2]        # [B*T, K, 2]
-
-        # ===== Extract discrete features and create embeddings =====
-        embeddings = []
-        continuous_indices = list(range(F))
-
-        # Handle lane embedding
-        if self.use_lane_embedding:
-            lane_ids = states_flat[..., self.lane_feature_idx].long()  # [B*T, K]
-            lane_ids = lane_ids.clamp(min=0, max=self.num_lanes - 1)
-            lane_embeds = self.lane_embedding(lane_ids)  # [B*T, K, lane_embed_dim]
-            embeddings.append(lane_embeds)
-            # Remove lane index from continuous features
-            if self.lane_feature_idx in continuous_indices:
-                continuous_indices.remove(self.lane_feature_idx)
-
-        # Handle site embedding (assume site_id is the last dimension if used)
-        if self.use_site_id:
-            site_id_idx = F - 1  # Last dimension
-            site_ids = states_flat[..., site_id_idx].long()  # [B*T, K]
-            site_ids = site_ids.clamp(min=0, max=self.num_sites - 1)
-            site_embeds = self.site_embedding(site_ids)  # [B*T, K, site_embed_dim]
-            embeddings.append(site_embeds)
-            # Remove site index from continuous features
-            if site_id_idx in continuous_indices:
-                continuous_indices.remove(site_id_idx)
-
-        # Extract continuous features (excluding discrete ones)
-        if len(embeddings) > 0:
-            # Use only continuous features
-            continuous_feats = torch.index_select(
-                states_flat, dim=-1, index=torch.tensor(continuous_indices, device=states_flat.device)
-            )  # [B*T, K, n_continuous]
-            # Concatenate continuous features with embeddings
-            agent_input = torch.cat([continuous_feats] + embeddings, dim=-1)
-        else:
-            # No embeddings, use all features as continuous
-            agent_input = states_flat  # [B*T, K, F]
-
-        # ===== 1. 每辆车特征嵌入 =====
-        agent_embeds = self.agent_embed(agent_input)  # [B*T, K, H]
-
-        # ===== 2. 空间位置编码 =====
-        if self.use_spatial_encoding:
-            spatial_enc = self.spatial_encoding(positions)           # [B*T, K, H]
-            agent_embeds = agent_embeds + spatial_enc
-
-        # ===== 3. Social pooling =====
-        if self.use_social_pooling:
-            pooled_features = self.social_pooling(
-                agent_embeds,  # [B*T, K, H]
-                positions,     # [B*T, K, 2]
-                masks_flat     # [B*T, K]
-            )  # 期望输出: [B*T, K, H]
-            agent_embeds = self.fusion(
-                torch.cat([agent_embeds, pooled_features], dim=-1)
-            )  # [B*T, K, H]
-
-        # ===== 4. Transformer 自注意力（在 agent 维度上）=====
-        # True = 不参与 attention
-        attn_mask = (masks_flat == 0)  # [B*T, K]
-
-        transformed = self.transformer(
-            agent_embeds,
-            src_key_padding_mask=attn_mask
-        )  # [B*T, K, H]
-
-        # （如果你以后想存 attention，可以在这里写 hook）
-
-        # ===== 5. 对 K 个 agent 做 masked mean pooling 得到“场景表示”=====
-        masks_expanded = masks_flat.unsqueeze(-1)  # [B*T, K, 1]
-        masked_sum = (transformed * masks_expanded).sum(dim=1)   # [B*T, H]
-        masked_count = masks_expanded.sum(dim=1).clamp(min=1.0)  # [B*T, 1]
-        aggregated = masked_sum / masked_count                   # [B*T, H]
-
-        # ===== 6. 投影到 latent 空间，并还原回 [B, T, D] =====
-        latent_flat = self.to_latent(aggregated)                 # [B*T, D]
-        latent = latent_flat.view(B, T, self.latent_dim)         # [B, T, D]
-
-        return latent
-
-
-class SimpleMLPEncoder(nn.Module):
-    """
-    Simpler MLP-based encoder without attention.
-    Useful as a baseline.
-    """
-
-    def __init__(
-        self,
-        input_dim: int = 6,
-        hidden_dim: int = 128,
-        latent_dim: int = 256,
-        dropout: float = 0.1
-    ):
-        super().__init__()
-
-        self.input_dim = input_dim
-        self.latent_dim = latent_dim
-
-        # Per-agent embedding
-        self.agent_embed = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-
-        # Aggregation and latent projection
-        self.to_latent = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, latent_dim)
-        )
-
-    def forward(
-        self,
-        states: torch.Tensor,
-        masks: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Encode via MLP + mean pooling.
-
-        Args:
-            states: [B, T, K, F]
-            masks: [B, T, K]
-
-        Returns:
-            latent: [B, T, D]
-        """
-        B, T, K, F = states.shape
-
-        # Embed agents
-        states_flat = states.view(B * T, K, F)
-        agent_embeds = self.agent_embed(states_flat)  # [B*T, K, H]
-
-        # Masked mean pooling
-        masks_flat = masks.view(B * T, K, 1)
-        masked_sum = (agent_embeds * masks_flat).sum(dim=1)
-        masked_count = masks_flat.sum(dim=1).clamp(min=1)
-        aggregated = masked_sum / masked_count  # [B*T, H]
-
-        # Project to latent
-        latent_flat = self.to_latent(aggregated)  # [B*T, D]
-        latent = latent_flat.view(B, T, self.latent_dim)
-
-        return latent
-
-
-class SpatialPositionalEncoding(nn.Module):
-    """
-    Spatial positional encoding based on vehicle positions.
-
-    Converts continuous (x, y) positions to learnable embeddings.
-    """
-
-    def __init__(self, d_model: int = 128, n_freq: int = 10):
-        """
-        Args:
-            d_model: Embedding dimension
-            n_freq: Number of frequency bands for encoding
-        """
-        super().__init__()
-
-        self.d_model = d_model
-        self.n_freq = n_freq
-
-        # Learnable projection from sine/cosine encodings to d_model
-        self.position_projection = nn.Linear(n_freq * 4, d_model)
-
-    def forward(self, positions: torch.Tensor) -> torch.Tensor:
-        """
-        Encode 2D positions.
-
-        Args:
-            positions: [B, N, 2] (x, y) coordinates
-
-        Returns:
-            embeddings: [B, N, d_model]
-        """
-        B, N, _ = positions.shape
-
-        # Create frequency bands
-        freq_bands = torch.pow(2, torch.linspace(0, self.n_freq - 1, self.n_freq,
-                                                   device=positions.device))
-
-        # Compute sine and cosine encodings
-        x = positions[..., 0:1]  # [B, N, 1]
-        y = positions[..., 1:2]  # [B, N, 1]
-
-        # [B, N, n_freq]
-        x_enc = torch.cat([
-            torch.sin(x * freq_bands),
-            torch.cos(x * freq_bands)
-        ], dim=-1)
-
-        y_enc = torch.cat([
-            torch.sin(y * freq_bands),
-            torch.cos(y * freq_bands)
-        ], dim=-1)
-
-        # Concatenate [B, N, n_freq * 4]
-        pos_enc = torch.cat([x_enc, y_enc], dim=-1)
-
-        # Project to d_model
-        embeddings = self.position_projection(pos_enc)
-
-        return embeddings
-
-
-class SocialPooling(nn.Module):
-    """
-    Social pooling layer for modeling local interactions.
-
-    Aggregates features from nearby vehicles using spatial attention.
-    """
-
-    def __init__(
-        self,
-        feature_dim: int = 128,
-        pooling_radius: float = 50.0,
-        use_distance_weighting: bool = True
-    ):
-        """
-        Args:
-            feature_dim: Feature dimension
-            pooling_radius: Radius for considering neighbors (meters)
-            use_distance_weighting: Whether to weight by distance
-        """
-        super().__init__()
-
-        self.feature_dim = feature_dim
-        self.pooling_radius = pooling_radius
-        self.use_distance_weighting = use_distance_weighting
-
-        # Learnable pooling weights
-        self.pool_weights = nn.Sequential(
-            nn.Linear(feature_dim + 2, feature_dim),  # +2 for relative position
-            nn.ReLU(),
-            nn.Linear(feature_dim, 1)
-        )
-
-    def forward(
-        self,
-        features: torch.Tensor,
-        positions: torch.Tensor,
-        mask: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Apply social pooling.
-
-        Args:
-            features: [B, N, D] vehicle features
-            positions: [B, N, 2] vehicle positions
-            mask: [B, N] validity mask
-
-        Returns:
-            pooled_features: [B, N, D]
-        """
-        B, N, D = features.shape
-
-        # Compute pairwise distances
-        pos_expanded_1 = positions.unsqueeze(2)  # [B, N, 1, 2]
-        pos_expanded_2 = positions.unsqueeze(1)  # [B, 1, N, 2]
-
-        # Relative positions [B, N, N, 2]
-        rel_pos = pos_expanded_1 - pos_expanded_2
-
-        # Distances [B, N, N]
-        distances = torch.norm(rel_pos, dim=-1)
-
-        # Create neighbor mask (within radius)
-        neighbor_mask = (distances < self.pooling_radius).float()
-        neighbor_mask = neighbor_mask * mask.unsqueeze(1)  # Apply validity mask
-        neighbor_mask = neighbor_mask * mask.unsqueeze(2)
-
-        # Self-mask (exclude self)
-        self_mask = 1 - torch.eye(N, device=features.device).unsqueeze(0)
-        neighbor_mask = neighbor_mask * self_mask
-
-        # Compute attention weights
-        # Expand features for all pairs [B, N, N, D]
-        features_expanded = features.unsqueeze(1).expand(-1, N, -1, -1)
-
-        # Concatenate features with relative position [B, N, N, D+2]
-        pool_input = torch.cat([features_expanded, rel_pos], dim=-1)
-
-        # Compute weights [B, N, N, 1]
-        weights = self.pool_weights(pool_input)
-
-        # Distance weighting (optional)
-        if self.use_distance_weighting:
-            distance_weights = torch.exp(-distances.unsqueeze(-1) / self.pooling_radius)
-            weights = weights * distance_weights
-
-        # Apply neighbor mask
-        weights = weights * neighbor_mask.unsqueeze(-1)
-
-        # Normalize weights
-        weight_sum = weights.sum(dim=2, keepdim=True).clamp(min=1e-8)
-        weights = weights / weight_sum
-
-        # Aggregate [B, N, D]
-        pooled = (features.unsqueeze(1) * weights).sum(dim=2)
-
-        return pooled
-
-
-class ImprovedMultiAgentEncoder(nn.Module):
-    """
-    Enhanced multi-agent encoder with spatial encoding and social pooling.
-
-    This encoder provides significant improvements over the base encoder:
-    - Spatial positional encoding (~5-10% improvement)
-    - Social pooling for local interactions (~10-15% improvement)
-    - Layer normalization and pre-norm architecture
-    - Optional attention weight saving for visualization
-    """
-
-    def __init__(
-        self,
-        input_dim: int = 6,
-        hidden_dim: int = 128,
-        latent_dim: int = 256,
-        n_heads: int = 4,
-        n_layers: int = 2,
-        dropout: float = 0.1,
-        use_spatial_encoding: bool = True,
-        use_social_pooling: bool = True,
-        pooling_radius: float = 50.0,
-        save_attention: bool = False
-    ):
-        """
-        Initialize improved encoder.
-
-        Args:
-            input_dim: Number of features per agent
-            hidden_dim: Hidden dimension for embeddings
-            latent_dim: Output latent dimension
-            n_heads: Number of attention heads
-            n_layers: Number of transformer layers
-            dropout: Dropout probability
-            use_spatial_encoding: Whether to use spatial positional encoding
-            use_social_pooling: Whether to use social pooling
-            pooling_radius: Radius for social pooling (meters)
-            save_attention: Whether to save attention weights for visualization
-        """
-        super().__init__()
-
-        self.input_dim = input_dim
-        self.hidden_dim = hidden_dim
-        self.latent_dim = latent_dim
-        self.use_spatial_encoding = use_spatial_encoding
-        self.use_social_pooling = use_social_pooling
-        self.save_attention = save_attention
-
-        # Per-agent feature embedding
-        self.agent_embed = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim)
-        )
-
-        # Spatial positional encoding
-        if use_spatial_encoding:
-            self.spatial_encoding = SpatialPositionalEncoding(
-                d_model=hidden_dim,
-                n_freq=10
-            )
-
-        # Social pooling
-        if use_social_pooling:
-            self.social_pooling = SocialPooling(
-                feature_dim=hidden_dim,
-                pooling_radius=pooling_radius,
-                use_distance_weighting=True
-            )
-
-            # Fusion layer for combining agent features and pooled features
-            self.fusion = nn.Sequential(
-                nn.Linear(hidden_dim * 2, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout)
-            )
-
-        # Transformer encoder layers
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim,
-            nhead=n_heads,
-            dim_feedforward=hidden_dim * 4,
-            dropout=dropout,
-            batch_first=True,
-            norm_first=True  # Pre-norm for better training
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer,
-            num_layers=n_layers
-        )
-
-        # Output projection to latent space
-        self.to_latent = nn.Sequential(
-            nn.Linear(hidden_dim, latent_dim),
-            nn.LayerNorm(latent_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(latent_dim, latent_dim)
-        )
-
-        # Storage for attention weights (if saving)
-        self.attention_weights = None
-
-    def forward(
-        self,
-        states: torch.Tensor,
-        masks: torch.Tensor
-    ) -> Tuple[torch.Tensor, Optional[Dict]]:
-        """
-        Encode multi-agent states.
-
-        Args:
-            states: [B, T, K, F] agent states
-            masks: [B, T, K] binary mask
-
-        Returns:
-            latent: [B, T, D] latent representation
-            aux_outputs: Dictionary with auxiliary outputs (attention, etc.)
-        """
-        B, T, K, F = states.shape
-
-        # Reshape to process all frames together
-        states_flat = states.view(B * T, K, F)
-        masks_flat = masks.view(B * T, K)
-
-        # Extract positions (assuming first 2 features are x, y)
-        positions = states_flat[..., :2]  # [B*T, K, 2]
-
-        # Embed each agent
-        agent_embeds = self.agent_embed(states_flat)  # [B*T, K, H]
-
-        # Add spatial positional encoding
-        if self.use_spatial_encoding:
-            spatial_enc = self.spatial_encoding(positions)
-            agent_embeds = agent_embeds + spatial_enc
-
-        # Apply social pooling
-        if self.use_social_pooling:
-            pooled_features = self.social_pooling(agent_embeds, positions, masks_flat)
-            # Fuse agent features with pooled features
-            agent_embeds = self.fusion(
-                torch.cat([agent_embeds, pooled_features], dim=-1)
-            )
-
-        # Create attention mask
-        attn_mask = (masks_flat == 0)  # [B*T, K]
-
-        # Apply transformer
-        transformed = self.transformer(
-            agent_embeds,
-            src_key_padding_mask=attn_mask
-        )  # [B*T, K, H]
-
-        # Save attention if requested
-        aux_outputs = {}
-        if self.save_attention and hasattr(self.transformer.layers[0].self_attn, 'attn_weights'):
-            aux_outputs['attention'] = self.transformer.layers[0].self_attn.attn_weights
-
-        # Aggregate across agents (masked mean pooling)
-        masks_expanded = masks_flat.unsqueeze(-1)  # [B*T, K, 1]
-        masked_sum = (transformed * masks_expanded).sum(dim=1)
-        masked_count = masks_expanded.sum(dim=1).clamp(min=1)
-        aggregated = masked_sum / masked_count  # [B*T, H]
-
-        # Project to latent space
-        latent_flat = self.to_latent(aggregated)  # [B*T, D]
-
-        # Reshape back
-        latent = latent_flat.view(B, T, self.latent_dim)
-
-        return latent, aux_outputs
-
-
-class RelativePositionEncoder(nn.Module):
-    """
-    Alternative encoder using relative position encoding.
-
-    Encodes pairwise relationships between vehicles using a graph-based approach.
-    """
-
-    def __init__(
-        self,
-        input_dim: int = 6,
-        hidden_dim: int = 128,
+        input_dim: int = 12,
+        hidden_dim: int = 256,
         latent_dim: int = 256,
         max_agents: int = 50,
-        dropout: float = 0.1
+        n_layers: int = 2,
+        n_heads: int = 8,
+        dropout: float = 0.1,
+        # discrete feature indices (must match your dataset feature order)
+        lane_feature_idx: int = 8,
+        class_feature_idx: int = 9,
+        site_feature_idx: int = 11,
+        # embedding configs
+        num_lanes: int = 100,
+        num_classes: int = 10,
+        num_sites: int = 10,
+        use_lane_embedding: bool = True,
+        use_class_embedding: bool = True,
+        use_site_id: bool = True,
+        lane_embed_dim: int = 16,
+        class_embed_dim: int = 8,
+        site_embed_dim: int = 8,
     ):
         super().__init__()
-
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.latent_dim = latent_dim
         self.max_agents = max_agents
 
-        # Individual agent encoder
-        self.agent_encoder = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
+        self.lane_feature_idx = lane_feature_idx
+        self.class_feature_idx = class_feature_idx
+        self.site_feature_idx = site_feature_idx
 
-        # Pairwise relation encoder
-        self.relation_encoder = nn.Sequential(
-            nn.Linear(hidden_dim * 2 + 3, hidden_dim),  # +3 for distance, angle, speed_diff
+        self.use_lane_embedding = use_lane_embedding
+        self.use_class_embedding = use_class_embedding
+        self.use_site_id = use_site_id
+
+        self.num_lanes = num_lanes
+        self.num_classes = num_classes
+        self.num_sites = num_sites
+
+        self.lane_embed_dim = lane_embed_dim if use_lane_embedding else 0
+        self.class_embed_dim = class_embed_dim if use_class_embedding else 0
+        self.site_embed_dim = site_embed_dim if use_site_id else 0
+
+        # Identify continuous feature indices by excluding discrete ones
+        discrete = {lane_feature_idx, class_feature_idx, site_feature_idx}
+        self.continuous_indices: List[int] = [i for i in range(input_dim) if i not in discrete]
+        self.n_cont = len(self.continuous_indices)
+
+        self.continuous_projector = nn.Sequential(
+            nn.Linear(self.n_cont, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim)
         )
 
-        # Graph aggregation
-        self.graph_aggregation = nn.Sequential(
-            nn.Linear(hidden_dim * 2, hidden_dim),
+        if use_lane_embedding:
+            self.lane_embedding = nn.Embedding(num_lanes, lane_embed_dim)
+        else:
+            self.lane_embedding = None
+
+        if use_class_embedding:
+            self.class_embedding = nn.Embedding(num_classes, class_embed_dim)
+        else:
+            self.class_embedding = None
+
+        if use_site_id:
+            self.site_embedding = nn.Embedding(num_sites, site_embed_dim)
+        else:
+            self.site_embedding = None
+
+        fused_dim = hidden_dim + self.lane_embed_dim + self.class_embed_dim + self.site_embed_dim
+        self.fusion = nn.Sequential(
+            nn.Linear(fused_dim, hidden_dim),
             nn.ReLU(),
-            nn.Dropout(dropout)
+            nn.Dropout(dropout),
         )
 
-        # Final encoder
-        self.final_encoder = nn.Sequential(
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.agent_transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+
+        self.to_latent = nn.Sequential(
             nn.Linear(hidden_dim, latent_dim),
-            nn.ReLU(),
-            nn.Linear(latent_dim, latent_dim)
+            nn.LayerNorm(latent_dim),
         )
 
-    def forward(
-        self,
-        states: torch.Tensor,
-        masks: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, states: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
         """
-        Encode using relative positions.
-
         Args:
-            states: [B, T, K, F]
-            masks: [B, T, K]
+            states: [B, T, K, F] (float, contains normalized continuous + discrete as float)
+            masks:  [B, T, K]    (0/1)
 
         Returns:
             latent: [B, T, D]
         """
+        if states.dim() != 4:
+            raise ValueError(f"states must be [B,T,K,F], got {tuple(states.shape)}")
+        if masks.dim() != 3:
+            raise ValueError(f"masks must be [B,T,K], got {tuple(masks.shape)}")
+
         B, T, K, F = states.shape
+        if K != self.max_agents:
+            raise ValueError(f"Expected K={self.max_agents}, got {K}")
+        if F != self.input_dim:
+            raise ValueError(f"Expected F={self.input_dim}, got {F}")
 
-        states_flat = states.view(B * T, K, F)
-        masks_flat = masks.view(B * T, K)
+        # Flatten B and T to process each frame: [B*T, K, F]
+        states_flat = states.reshape(B * T, K, F)
+        masks_flat = masks.reshape(B * T, K)  # [B*T, K]
+        pad = (masks_flat == 0)
 
-        # Encode individual agents
-        agent_features = self.agent_encoder(states_flat)  # [B*T, K, H]
+        # Continuous features
+        cont = states_flat[..., self.continuous_indices]  # [B*T, K, n_cont]
+        cont_emb = self.continuous_projector(cont)  # [B*T, K, H]
 
-        # Compute pairwise relations
-        positions = states_flat[..., :2]  # [B*T, K, 2]
-        velocities = states_flat[..., 2:4] if F >= 4 else torch.zeros_like(positions)
+        embeddings = [cont_emb]
 
-        # Expand for pairwise computation
-        feat_i = agent_features.unsqueeze(2)  # [B*T, K, 1, H]
-        feat_j = agent_features.unsqueeze(1)  # [B*T, 1, K, H]
+        # Discrete embeddings (make safe)
+        if self.use_lane_embedding:
+            lane_ids = states_flat[..., self.lane_feature_idx].long()
+            lane_ids = lane_ids.clamp(min=0, max=self.num_lanes - 1)
+            lane_ids = lane_ids.masked_fill(pad, 0)
+            embeddings.append(self.lane_embedding(lane_ids))
 
-        pos_i = positions.unsqueeze(2)  # [B*T, K, 1, 2]
-        pos_j = positions.unsqueeze(1)  # [B*T, 1, K, 2]
+        if self.use_class_embedding:
+            class_ids = states_flat[..., self.class_feature_idx].long()
+            class_ids = class_ids.clamp(min=0, max=self.num_classes - 1)
+            class_ids = class_ids.masked_fill(pad, 0)
+            embeddings.append(self.class_embedding(class_ids))
 
-        vel_i = velocities.unsqueeze(2)
-        vel_j = velocities.unsqueeze(1)
+        if self.use_site_id:
+            site_ids = states_flat[..., self.site_feature_idx].long()
+            site_ids = site_ids.clamp(min=0, max=self.num_sites - 1)
+            site_ids = site_ids.masked_fill(pad, 0)
+            embeddings.append(self.site_embedding(site_ids))
 
-        # Relative features
-        rel_pos = pos_j - pos_i  # [B*T, K, K, 2]
-        distance = torch.norm(rel_pos, dim=-1, keepdim=True)  # [B*T, K, K, 1]
-        angle = torch.atan2(rel_pos[..., 1:2], rel_pos[..., 0:1])  # [B*T, K, K, 1]
+        agent_feats = torch.cat(embeddings, dim=-1)  # [B*T, K, fused_dim]
+        agent_feats = self.fusion(agent_feats)       # [B*T, K, H]
 
-        rel_vel = vel_j - vel_i
-        speed_diff = torch.norm(rel_vel, dim=-1, keepdim=True)  # [B*T, K, K, 1]
+        # Agent transformer (per-frame). Mask padded agents.
+        # src_key_padding_mask: True for positions to ignore
+        src_key_padding_mask = pad  # [B*T, K] bool
+        agent_feats = self.agent_transformer(agent_feats, src_key_padding_mask=src_key_padding_mask)
 
-        # Concatenate relation features
-        relation_input = torch.cat([
-            feat_i.expand(-1, -1, K, -1),
-            feat_j.expand(-1, K, -1, -1),
-            distance,
-            angle,
-            speed_diff
-        ], dim=-1)  # [B*T, K, K, 2H+3]
+        # Masked mean pool over agents to scene embedding per frame
+        weights = masks_flat.unsqueeze(-1)  # [B*T, K, 1]
+        pooled = (agent_feats * weights).sum(dim=1) / (weights.sum(dim=1).clamp(min=1e-6))  # [B*T, H]
 
-        # Encode relations
-        relation_features = self.relation_encoder(relation_input)  # [B*T, K, K, H]
-
-        # Apply mask
-        mask_pairs = masks_flat.unsqueeze(1) * masks_flat.unsqueeze(2)  # [B*T, K, K]
-        relation_features = relation_features * mask_pairs.unsqueeze(-1)
-
-        # Aggregate relations
-        aggregated_relations = relation_features.sum(dim=2)  # [B*T, K, H]
-        aggregated_relations = aggregated_relations / mask_pairs.sum(dim=2, keepdim=True).clamp(min=1)
-
-        # Combine with agent features
-        combined = self.graph_aggregation(
-            torch.cat([agent_features, aggregated_relations], dim=-1)
-        )  # [B*T, K, H]
-
-        # Global pooling
-        masks_expanded = masks_flat.unsqueeze(-1)
-        pooled = (combined * masks_expanded).sum(dim=1) / masks_expanded.sum(dim=1).clamp(min=1)
-
-        # Final encoding
-        latent_flat = self.final_encoder(pooled)  # [B*T, D]
-        latent = latent_flat.view(B, T, self.latent_dim)
-
+        latent = self.to_latent(pooled).view(B, T, self.latent_dim)  # [B,T,D]
         return latent
-
-
-if __name__ == '__main__':
-    # Test basic encoder
-    print("Testing MultiAgentEncoder...")
-    B, T, K, F = 4, 10, 20, 6
-    states = torch.randn(B, T, K, F)
-    masks = torch.randint(0, 2, (B, T, K)).float()
-
-    encoder = MultiAgentEncoder(
-        input_dim=F,
-        hidden_dim=128,
-        latent_dim=256
-    )
-
-    latent = encoder(states, masks)
-    print(f"Input shape: {states.shape}")
-    print(f"Output shape: {latent.shape}")  # Should be [B, T, 256]
-
-    # Test improved encoder
-    print("\nTesting ImprovedMultiAgentEncoder...")
-    encoder = ImprovedMultiAgentEncoder(
-        input_dim=F,
-        hidden_dim=128,
-        latent_dim=256,
-        use_spatial_encoding=True,
-        use_social_pooling=True,
-        pooling_radius=50.0,
-        save_attention=True
-    )
-
-    latent, aux = encoder(states, masks)
-
-    print(f"Input shape: {states.shape}")
-    print(f"Output shape: {latent.shape}")
-    print(f"Auxiliary outputs: {list(aux.keys())}")
-
-    # Test relative position encoder
-    print("\nTesting RelativePositionEncoder...")
-    rel_encoder = RelativePositionEncoder(
-        input_dim=F,
-        hidden_dim=128,
-        latent_dim=256
-    )
-
-    latent_rel = rel_encoder(states, masks)
-    print(f"Relative encoder output shape: {latent_rel.shape}")

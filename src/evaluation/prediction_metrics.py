@@ -7,6 +7,12 @@ Includes ADE, FDE, collision rate, and other metrics.
 import torch
 import numpy as np
 from typing import Dict, Tuple, Optional
+import sys
+from pathlib import Path
+
+# Add parent directory to path for imports
+sys.path.append(str(Path(__file__).parent.parent))
+from utils.common import convert_pixels_to_meters, get_pixel_to_meter_conversion
 
 
 def compute_ade(
@@ -252,7 +258,9 @@ def compute_all_metrics(
     predicted: torch.Tensor,
     ground_truth: torch.Tensor,
     masks: torch.Tensor,
-    predicted_existence: Optional[torch.Tensor] = None
+    predicted_existence: Optional[torch.Tensor] = None,
+    pixel_to_meter: Optional[float] = None,
+    convert_to_meters: bool = False
 ) -> Dict[str, float]:
     """
     Compute all evaluation metrics.
@@ -262,10 +270,36 @@ def compute_all_metrics(
         ground_truth: [B, T, K, F] ground truth states
         masks: [B, T, K] binary masks
         predicted_existence: [B, T, K] optional existence predictions
+        pixel_to_meter: Conversion factor from pixels to meters.
+                       If None and convert_to_meters=True, will auto-load.
+        convert_to_meters: If True, convert coordinates from pixels to meters
+                          before computing metrics
 
     Returns:
-        Dictionary of all metrics
+        Dictionary of all metrics (in meters if convert_to_meters=True)
     """
+    # Apply coordinate conversion if requested
+    if convert_to_meters:
+        if pixel_to_meter is None:
+            pixel_to_meter = get_pixel_to_meter_conversion()
+            print(f"Auto-loaded pixel_to_meter conversion factor: {pixel_to_meter:.6f}")
+
+        # Convert both predicted and ground truth to meters
+        predicted = convert_pixels_to_meters(
+            predicted,
+            pixel_to_meter,
+            position_indices=(0, 1),
+            velocity_indices=(2, 3) if predicted.shape[-1] > 3 else None,
+            acceleration_indices=(4, 5) if predicted.shape[-1] > 5 else None
+        )
+        ground_truth = convert_pixels_to_meters(
+            ground_truth,
+            pixel_to_meter,
+            position_indices=(0, 1),
+            velocity_indices=(2, 3) if ground_truth.shape[-1] > 3 else None,
+            acceleration_indices=(4, 5) if ground_truth.shape[-1] > 5 else None
+        )
+
     metrics = {
         'ade': compute_ade(predicted, ground_truth, masks),
         'fde': compute_fde(predicted, ground_truth, masks),

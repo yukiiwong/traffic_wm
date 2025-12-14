@@ -1,9 +1,16 @@
 """
-Latent Dynamics Model
+Latent Dynamics Model (Transformer-only)
 
-Models temporal evolution in latent space.
-Can use GRU, LSTM, or Transformer for temporal modeling.
+This module models temporal evolution in latent space.
+
+Key changes vs. old version:
+- Transformer-only (no GRU/LSTM/RSSM).
+- Causal masking: output[t] can only attend to <= t.
+- Positional encoding for temporal order.
+- Optional time padding mask to ignore padded timesteps.
 """
+
+from __future__ import annotations
 
 import torch
 import torch.nn as nn
@@ -14,262 +21,134 @@ class LatentDynamics(nn.Module):
     """
     Temporal dynamics model in latent space.
 
-    Takes latent sequence [B, T, D] and predicts next latent states.
+    Input:
+        latent: [B, T, D]  (encoded latents)
+    Output:
+        predicted_latent: [B, T, D]  where predicted_latent[:, t] predicts latent at time t+1
+                                     (the last timestep is usually ignored in the one-step loss).
     """
 
     def __init__(
         self,
         latent_dim: int = 256,
-        hidden_dim: int = 512,
-        n_layers: int = 2,
+        n_layers: int = 4,
+        n_heads: int = 8,
         dropout: float = 0.1,
-        model_type: str = 'gru'
+        max_len: int = 512,
+        use_learned_pos_emb: bool = True,
     ):
-        """
-        Initialize latent dynamics model.
-
-        Args:
-            latent_dim: Dimension of latent space (D)
-            hidden_dim: Hidden dimension for RNN/Transformer
-            n_layers: Number of layers
-            dropout: Dropout probability
-            model_type: 'gru', 'lstm', or 'transformer'
-        """
         super().__init__()
-
         self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
-        self.model_type = model_type
+        self.max_len = max_len
+        self.use_learned_pos_emb = use_learned_pos_emb
 
-        if model_type == 'gru':
-            self.rnn = nn.GRU(
-                input_size=latent_dim,
-                hidden_size=hidden_dim,
-                num_layers=n_layers,
-                dropout=dropout if n_layers > 1 else 0,
-                batch_first=True
-            )
-        elif model_type == 'lstm':
-            self.rnn = nn.LSTM(
-                input_size=latent_dim,
-                hidden_size=hidden_dim,
-                num_layers=n_layers,
-                dropout=dropout if n_layers > 1 else 0,
-                batch_first=True
-            )
-        elif model_type == 'transformer':
-            encoder_layer = nn.TransformerEncoderLayer(
-                d_model=latent_dim,
-                nhead=8,
-                dim_feedforward=hidden_dim,
-                dropout=dropout,
-                batch_first=True
-            )
-            self.transformer = nn.TransformerEncoder(
-                encoder_layer,
-                num_layers=n_layers
-            )
+        if use_learned_pos_emb:
+            self.pos_emb = nn.Parameter(torch.zeros(1, max_len, latent_dim))
+            nn.init.normal_(self.pos_emb, mean=0.0, std=0.02)
         else:
-            raise ValueError(f"Unknown model_type: {model_type}")
+            self.register_buffer("pos_emb", self._build_sinusoidal_pos_emb(max_len, latent_dim), persistent=False)
 
-        # Output projection back to latent space
-        if model_type in ['gru', 'lstm']:
-            self.output_proj = nn.Linear(hidden_dim, latent_dim)
-        # For transformer, output is already in latent_dim
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=latent_dim,
+            nhead=n_heads,
+            dim_feedforward=latent_dim * 4,
+            dropout=dropout,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+
+        # Small output projection (helps stability / capacity)
+        self.output_proj = nn.Sequential(
+            nn.LayerNorm(latent_dim),
+            nn.Linear(latent_dim, latent_dim),
+        )
+
+    @staticmethod
+    def _build_sinusoidal_pos_emb(max_len: int, d_model: int) -> torch.Tensor:
+        """[1, max_len, d_model] sinusoidal position encoding."""
+        position = torch.arange(max_len).float().unsqueeze(1)  # [max_len, 1]
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-torch.log(torch.tensor(10000.0)) / d_model))
+        pe = torch.zeros(max_len, d_model)
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        return pe.unsqueeze(0)  # [1, max_len, d_model]
+
+    @staticmethod
+    def _causal_mask(T: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        """
+        Causal mask for TransformerEncoder: shape [T, T].
+        Masked positions are -inf (additive mask).
+        """
+        # Upper triangular (excluding diagonal) should be masked
+        mask = torch.full((T, T), float("-inf"), device=device, dtype=dtype)
+        mask = torch.triu(mask, diagonal=1)
+        return mask
 
     def forward(
         self,
         latent: torch.Tensor,
-        hidden: Optional[Tuple[torch.Tensor, ...]] = None
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
+        hidden: Optional[Tuple[torch.Tensor, ...]] = None,  # kept for API compatibility
+        time_padding_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, None]:
         """
-        Forward pass through dynamics model.
-
         Args:
-            latent: [B, T, D] latent states
-            hidden: Optional hidden state for RNNs
+            latent: [B, T, D]
+            time_padding_mask: [B, T] with True for padded timesteps (ignored by attention)
 
         Returns:
-            output: [B, T, D] predicted latent states
-            hidden: Updated hidden state (for RNNs)
+            predicted_latent: [B, T, D]
+            None: (no hidden state for transformer)
         """
-        if self.model_type == 'transformer':
-            output = self.transformer(latent)
-            return output, None
+        del hidden  # not used
 
-        else:  # GRU or LSTM
-            if hidden is not None:
-                rnn_out, hidden = self.rnn(latent, hidden)
-            else:
-                rnn_out, hidden = self.rnn(latent)
+        if latent.dim() != 3:
+            raise ValueError(f"latent must be [B, T, D], got {tuple(latent.shape)}")
 
-            output = self.output_proj(rnn_out)  # [B, T, D]
-            return output, hidden
+        B, T, D = latent.shape
+        if D != self.latent_dim:
+            raise ValueError(f"Expected latent_dim={self.latent_dim}, got D={D}")
+        if T > self.max_len:
+            raise ValueError(f"T={T} exceeds max_len={self.max_len}. Increase max_len.")
 
+        x = latent + self.pos_emb[:, :T, :].to(latent.dtype)
+
+        causal = self._causal_mask(T, device=latent.device, dtype=latent.dtype)
+
+        out = self.transformer(
+            x,
+            mask=causal,
+            src_key_padding_mask=time_padding_mask,
+        )  # [B, T, D]
+
+        out = self.output_proj(out)  # [B, T, D]
+        return out, None
+
+    @torch.no_grad()
     def step(
         self,
-        latent_t: torch.Tensor,
-        hidden: Optional[Tuple[torch.Tensor, ...]] = None
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, ...]]]:
+        latent_history: torch.Tensor,
+        time_padding_mask: Optional[torch.Tensor] = None,
+        max_context: Optional[int] = None,
+    ) -> torch.Tensor:
         """
-        Single-step prediction (for autoregressive rollout).
+        One-step prediction using full (or truncated) history.
 
         Args:
-            latent_t: [B, 1, D] or [B, D] current latent state
-            hidden: Hidden state from previous step
+            latent_history: [B, T, D] latents up to current time t (inclusive)
+            time_padding_mask: [B, T] optional padding mask
+            max_context: if set, only use last max_context steps for efficiency
 
         Returns:
-            next_latent: [B, D] predicted next latent
-            hidden: Updated hidden state
+            next_latent: [B, D] predicted latent for time t+1
         """
-        if latent_t.dim() == 2:
-            latent_t = latent_t.unsqueeze(1)  # [B, D] -> [B, 1, D]
+        if latent_history.dim() != 3:
+            raise ValueError(f"latent_history must be [B, T, D], got {tuple(latent_history.shape)}")
 
-        if self.model_type == 'transformer':
-            # For transformer, we need full history - use caching for efficiency
-            output = self.transformer(latent_t)
-            return output.squeeze(1), None
+        if max_context is not None and latent_history.size(1) > max_context:
+            latent_history = latent_history[:, -max_context:, :]
+            if time_padding_mask is not None:
+                time_padding_mask = time_padding_mask[:, -max_context:]
 
-        else:  # GRU or LSTM
-            rnn_out, hidden = self.rnn(latent_t, hidden)
-            output = self.output_proj(rnn_out)
-            return output.squeeze(1), hidden
-
-
-class RSSMDynamics(nn.Module):
-    """
-    Recurrent State-Space Model (RSSM) dynamics.
-
-    Separates deterministic and stochastic components.
-    Used in Dreamer-style world models.
-    """
-
-    def __init__(
-        self,
-        latent_dim: int = 256,
-        hidden_dim: int = 512,
-        stochastic_dim: int = 32,
-        n_layers: int = 2,
-        dropout: float = 0.1
-    ):
-        super().__init__()
-
-        self.latent_dim = latent_dim
-        self.hidden_dim = hidden_dim
-        self.stochastic_dim = stochastic_dim
-
-        # Deterministic state (recurrent)
-        self.rnn = nn.GRU(
-            input_size=latent_dim + stochastic_dim,
-            hidden_size=hidden_dim,
-            num_layers=n_layers,
-            dropout=dropout if n_layers > 1 else 0,
-            batch_first=True
-        )
-
-        # Stochastic state (prior)
-        self.prior = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, stochastic_dim * 2)  # mean and logvar
-        )
-
-        # Stochastic state (posterior, using observation)
-        self.posterior = nn.Sequential(
-            nn.Linear(hidden_dim + latent_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, stochastic_dim * 2)
-        )
-
-    def forward(
-        self,
-        latent: torch.Tensor,
-        hidden: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, dict]:
-        """
-        RSSM forward pass with both prior and posterior.
-
-        Args:
-            latent: [B, T, D] observed latent states
-            hidden: [n_layers, B, H] initial hidden state
-
-        Returns:
-            reconstructed: [B, T, D] reconstructed latent
-            info: Dictionary with prior/posterior distributions
-        """
-        B, T, D = latent.shape
-
-        # Initialize hidden state if not provided
-        if hidden is None:
-            hidden = torch.zeros(
-                self.rnn.num_layers, B, self.hidden_dim,
-                device=latent.device
-            )
-
-        # Storage for outputs
-        stochastic_states = []
-        prior_dists = []
-        posterior_dists = []
-
-        # Process sequence
-        for t in range(T):
-            latent_t = latent[:, t]  # [B, D]
-
-            # Posterior (using observation)
-            post_input = torch.cat([hidden[-1], latent_t], dim=-1)
-            post_params = self.posterior(post_input)
-            post_mean, post_logvar = torch.chunk(post_params, 2, dim=-1)
-
-            # Sample stochastic state
-            stoch = self._sample_gaussian(post_mean, post_logvar)
-            stochastic_states.append(stoch)
-
-            # Update deterministic state
-            rnn_input = torch.cat([latent_t, stoch], dim=-1).unsqueeze(1)
-            _, hidden = self.rnn(rnn_input, hidden)
-
-            # Prior (for KL loss)
-            prior_params = self.prior(hidden[-1])
-            prior_mean, prior_logvar = torch.chunk(prior_params, 2, dim=-1)
-
-            prior_dists.append((prior_mean, prior_logvar))
-            posterior_dists.append((post_mean, post_logvar))
-
-        # Stack outputs
-        stochastic = torch.stack(stochastic_states, dim=1)  # [B, T, S]
-
-        info = {
-            'prior_dists': prior_dists,
-            'posterior_dists': posterior_dists,
-            'stochastic': stochastic,
-            'hidden': hidden
-        }
-
-        return stochastic, info
-
-    def _sample_gaussian(self, mean: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-        """Reparameterization trick."""
-        std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mean + eps * std
-
-
-if __name__ == '__main__':
-    # Test dynamics model
-    B, T, D = 4, 10, 256
-
-    latent = torch.randn(B, T, D)
-
-    # Test GRU dynamics
-    dynamics = LatentDynamics(
-        latent_dim=D,
-        hidden_dim=512,
-        model_type='gru'
-    )
-
-    output, hidden = dynamics(latent)
-    print(f"GRU output shape: {output.shape}")  # [B, T, D]
-
-    # Test single step
-    next_latent, hidden = dynamics.step(latent[:, 0], hidden)
-    print(f"Step output shape: {next_latent.shape}")  # [B, D]
+        pred, _ = self.forward(latent_history, time_padding_mask=time_padding_mask)
+        return pred[:, -1, :]  # output at last token predicts next latent

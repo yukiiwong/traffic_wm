@@ -7,6 +7,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from typing import Optional
+from pathlib import Path
+import json
 
 
 def set_seed(seed: int = 42):
@@ -196,6 +198,89 @@ class EarlyStopping:
                 return True
 
         return False
+
+
+def get_pixel_to_meter_conversion(
+    lane_geometry_path: Optional[str] = None,
+    default_value: float = 0.07696103842104474
+) -> float:
+    """
+    Get pixel to meter conversion factor.
+
+    Args:
+        lane_geometry_path: Path to lane_geometry_summary.json file.
+                          If None, searches in default locations.
+        default_value: Default conversion factor if file not found
+
+    Returns:
+        Pixel to meter conversion factor
+    """
+    if lane_geometry_path is None:
+        # Try default locations
+        possible_paths = [
+            Path(__file__).parent.parent.parent.parent / "lane_extraction" / "01_data" / "lane_geometry_summary.json",
+            Path("../lane_extraction/01_data/lane_geometry_summary.json"),
+            Path("../../lane_extraction/01_data/lane_geometry_summary.json"),
+        ]
+
+        for path in possible_paths:
+            if path.exists():
+                lane_geometry_path = str(path)
+                break
+
+    if lane_geometry_path and Path(lane_geometry_path).exists():
+        try:
+            with open(lane_geometry_path, 'r') as f:
+                data = json.load(f)
+                pixel_to_meter = data.get('pixel_to_meter', default_value)
+                print(f"Loaded pixel_to_meter = {pixel_to_meter:.6f} from {lane_geometry_path}")
+                return float(pixel_to_meter)
+        except Exception as e:
+            print(f"Warning: Could not load conversion factor from {lane_geometry_path}: {e}")
+
+    print(f"Using default pixel_to_meter = {default_value:.6f}")
+    return default_value
+
+
+def convert_pixels_to_meters(
+    states: torch.Tensor,
+    pixel_to_meter: float,
+    position_indices: tuple = (0, 1),
+    velocity_indices: tuple = (2, 3),
+    acceleration_indices: tuple = (4, 5)
+) -> torch.Tensor:
+    """
+    Convert pixel-based coordinates to meters.
+
+    Args:
+        states: Tensor of shape [..., F] where F is feature dimension
+        pixel_to_meter: Conversion factor (meters per pixel)
+        position_indices: Indices for position features (x, y)
+        velocity_indices: Indices for velocity features (vx, vy)
+        acceleration_indices: Indices for acceleration features (ax, ay)
+
+    Returns:
+        Converted states tensor (same shape as input)
+    """
+    states = states.clone()
+
+    # Convert positions: pixels -> meters
+    if position_indices is not None:
+        for idx in position_indices:
+            states[..., idx] *= pixel_to_meter
+
+    # Convert velocities: pixels/frame -> meters/second
+    # Note: velocities are already computed with dt, so just scale by pixel_to_meter
+    if velocity_indices is not None:
+        for idx in velocity_indices:
+            states[..., idx] *= pixel_to_meter
+
+    # Convert accelerations: pixels/frame^2 -> meters/second^2
+    if acceleration_indices is not None:
+        for idx in acceleration_indices:
+            states[..., idx] *= pixel_to_meter
+
+    return states
 
 
 if __name__ == '__main__':
