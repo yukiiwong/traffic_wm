@@ -91,11 +91,15 @@ class TrajectoryDataset(Dataset):
         self.num_lanes = 0
         self.num_classes = 0
         self.num_sites = 0
+        self.metadata = {}  # Initialize empty metadata dict
 
         if metadata_path.exists():
             try:
                 with open(metadata_path, 'r') as f:
                     metadata = json.load(f)
+
+                # Store metadata as instance attribute
+                self.metadata = metadata
 
                 # Get discrete feature indices from metadata
                 validation_info = metadata.get('validation_info', {})
