@@ -20,6 +20,7 @@ class StateDecoder(nn.Module):
         latent_dim: int = 256,
         hidden_dim: int = 256,
         output_dim: int = 12,
+        continuous_dim: int = 9,  # Number of continuous features to output
         max_agents: int = 50,
         dropout: float = 0.1,
         enable_xy_residual: bool = True,
@@ -27,7 +28,8 @@ class StateDecoder(nn.Module):
         super().__init__()
         self.latent_dim = latent_dim
         self.hidden_dim = hidden_dim
-        self.output_dim = output_dim
+        self.output_dim = output_dim  # Full dimension (for reference)
+        self.continuous_dim = continuous_dim  # Only continuous features
         self.max_agents = max_agents
         self.enable_xy_residual = enable_xy_residual
 
@@ -41,8 +43,8 @@ class StateDecoder(nn.Module):
             nn.Dropout(dropout),
         )
 
-        # Absolute state head
-        self.state_head = nn.Linear(hidden_dim, max_agents * output_dim)
+        # Absolute state head - ONLY outputs continuous features
+        self.state_head = nn.Linear(hidden_dim, max_agents * continuous_dim)
 
         # Existence logits head
         self.existence_head = nn.Linear(hidden_dim, max_agents)
@@ -80,7 +82,8 @@ class StateDecoder(nn.Module):
 
         h = self.backbone(latent)  # [B, T, H]
 
-        states = self.state_head(h).view(B, T, self.max_agents, self.output_dim)  # [B, T, K, F]
+        # Output only continuous features
+        states = self.state_head(h).view(B, T, self.max_agents, self.continuous_dim)  # [B, T, K, F_cont]
         existence_logits = self.existence_head(h)  # [B, T, K]
 
         residual_xy = None

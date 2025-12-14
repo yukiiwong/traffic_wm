@@ -38,11 +38,13 @@ class WorldModelLoss(nn.Module):
 
     def _masked_huber_loss(self, pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
-        pred/target: [B, T, K, F]
-        mask:        [B, T, K]  (0/1)
+        pred: [B, T, K, F_cont] - predictions (already continuous-only from decoder)
+        target: [B, T, K, F_full] - targets (full features, needs filtering)
+        mask:   [B, T, K]  (0/1)
         """
+        # Target needs filtering to continuous features only
+        # Pred is already continuous-only from decoder (no filtering needed)
         if self.continuous_indices is not None:
-            pred = pred[..., self.continuous_indices]
             target = target[..., self.continuous_indices]
 
         # SmoothL1 in "beta" form (PyTorch SmoothL1Loss uses beta)
@@ -67,13 +69,15 @@ class WorldModelLoss(nn.Module):
     def forward(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         targets must include:
-          - states: [B,T,K,F]
+          - states: [B,T,K,F_full] (full features including discrete, will be filtered to continuous)
           - masks:  [B,T,K]
         predictions must include:
-          - reconstructed_states: [B,T,K,F]
-          - predicted_states:     [B,T,K,F]
+          - reconstructed_states: [B,T,K,F_cont] (continuous features only)
+          - predicted_states:     [B,T,K,F_cont] (continuous features only)
           - existence_logits:     [B,T,K]
           - predicted_existence_logits: [B,T,K] (optional)
+
+        Note: Predictions are continuous-only. Targets will be filtered to continuous features using continuous_indices.
         """
         states = targets["states"]
         masks = targets["masks"]

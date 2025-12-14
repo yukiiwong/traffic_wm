@@ -5,9 +5,10 @@
 **核心特性**:
 - 🚁 多站点无人机数据支持 (Sites A-I)
 - 🧠 Transformer编码器 + Transformer时序动力学 + 物理先验
-- 🎯 12维特征 + Site/Lane/Class embeddings
+- 🎯 12维输入特征 → 9维连续特征预测 + Site/Lane/Class embeddings
 - ⏱️ 时序无重叠的train/val/test划分
 - 🔧 完整的预处理、训练、评估流程
+- 🔥 v2.3: Decoder只输出连续特征，离散特征作为episode-level常量
 
 ---
 
@@ -42,6 +43,7 @@ pip install -r requirements.txt
 
 ### 完整流程（4步）
 
+**多站点训练（全部9个站点）**:
 ```bash
 # 1. 数据预处理
 python preprocess_multisite.py
@@ -54,6 +56,7 @@ python src/training/train_world_model.py \
     --train_data data/processed/train_episodes.npz \
     --val_data data/processed/val_episodes.npz \
     --input_dim 12 \
+    --continuous_dim 9 \
     --latent_dim 256 \
     --batch_size 16 \
     --epochs 50 \
@@ -65,6 +68,32 @@ python src/evaluation/rollout_eval.py \
     --test_data data/processed/test_episodes.npz \
     --context_length 65 \
     --rollout_horizon 15
+```
+
+**单站点训练（例如只训练Site A）**:
+```bash
+# 1. 预处理单站点
+python preprocess_multisite.py --sites A --output_dir data/processed_siteA
+
+# 2. 验证数据
+python validate_preprocessing.py --data_dir data/processed_siteA
+
+# 3. 训练模型
+python src/training/train_world_model.py \
+    --train_data data/processed_siteA/train_episodes.npz \
+    --val_data data/processed_siteA/val_episodes.npz \
+    --checkpoint_dir checkpoints/world_model_siteA \
+    --input_dim 12 \
+    --continuous_dim 9 \
+    --num_sites 1 \
+    --num_lanes 19 \
+    --batch_size 16 \
+    --epochs 50
+
+# 4. 评估模型
+python src/evaluation/rollout_eval.py \
+    --checkpoint checkpoints/world_model_siteA/best_model.pt \
+    --test_data data/processed_siteA/test_episodes.npz
 ```
 
 ---
@@ -198,27 +227,28 @@ data/processed/
 
 ### 步骤3: 特征说明
 
-预处理生成**12维特征向量** (`src/data/preprocess.py:extract_extended_features()`):
+预处理生成**12维输入特征向量** (`src/data/preprocess.py:extract_extended_features()`):
 
-| 索引 | 特征名 | 类型 | 说明 | 代码位置 |
-|------|--------|------|------|---------|
-| 0 | center_x | 连续 | X坐标（z-score标准化） | `extract_extended_features()` L385 |
-| 1 | center_y | 连续 | Y坐标（z-score标准化） | L386 |
-| 2 | vx | 连续 | X方向速度 | L388 |
-| 3 | vy | 连续 | Y方向速度 | L389 |
-| 4 | ax | 连续 | X方向加速度 | L390 |
-| 5 | ay | 连续 | Y方向加速度 | L391 |
-| 6 | angle | 连续 | 朝向角度 | L392 |
-| 7 | class_id | **离散** | 车辆类别（不标准化） | L393 |
-| 8 | lane_id | **离散** | 车道ID（不标准化） | L394 |
-| 9 | has_preceding | 二值 | 是否有前车 | L395 |
-| 10 | has_following | 二值 | 是否有后车 | L396 |
-| 11 | site_id | **离散** | 站点ID 0-8（不标准化） | L397 |
+| 索引 | 特征名 | 类型 | 模型处理 | 说明 | 代码位置 |
+|------|--------|------|---------|------|---------|
+| 0 | center_x | 连续 | ✅ **预测** | X坐标（z-score标准化） | `extract_extended_features()` L385 |
+| 1 | center_y | 连续 | ✅ **预测** | Y坐标（z-score标准化） | L386 |
+| 2 | vx | 连续 | ✅ **预测** | X方向速度 | L388 |
+| 3 | vy | 连续 | ✅ **预测** | Y方向速度 | L389 |
+| 4 | ax | 连续 | ✅ **预测** | X方向加速度 | L390 |
+| 5 | ay | 连续 | ✅ **预测** | Y方向加速度 | L391 |
+| 6 | angle | 连续 | ✅ **预测** | 朝向角度 | L392 |
+| 7 | class_id | **离散** | 🔒 **Embedding** | 车辆类别（不标准化，不预测） | L393 |
+| 8 | lane_id | **离散** | 🔒 **Embedding** | 车道ID（不标准化，不预测） | L394 |
+| 9 | has_preceding | 二值 | ✅ **预测** | 是否有前车 | L395 |
+| 10 | has_following | 二值 | ✅ **预测** | 是否有后车 | L396 |
+| 11 | site_id | **离散** | 🔒 **Episode-level** | 站点ID 0-8（不标准化，不预测） | L397 |
 
-**关键**:
-- ✅ **连续特征** (0-6, 9-10): z-score标准化 (mean~0, std~1)
-- ❌ **离散特征** (7, 8, 11): **不进行标准化**，保持原始整数值
-- 离散特征用于embedding，必须保持整数形式
+**v2.3 关键架构 (Continuous-Only Decoder)**:
+- ✅ **连续特征 (9维)**: [0,1,2,3,4,5,6,9,10] - Decoder **直接预测**这些特征
+- 🔒 **离散特征 (3维)**: [7,8,11] - 作为 **Embedding 输入**，episode内保持常量，**不参与预测**
+- 📊 **Loss计算**: 仅在9个连续特征上计算回归loss (Huber)
+- 🎯 **Rollout**: Decoder输出[B,T,K,9]，离散特征从初始状态复制
 
 ### 步骤4: 验证预处理结果
 
@@ -276,12 +306,14 @@ cat data/processed/metadata.json | grep n_features
 
 ### 步骤2: 训练命令
 
+**多站点训练（默认）**:
 ```bash
 python src/training/train_world_model.py \
     --train_data data/processed/train_episodes.npz \
     --val_data data/processed/val_episodes.npz \
     --checkpoint_dir checkpoints/world_model \
     --input_dim 12 \
+    --continuous_dim 9 \
     --latent_dim 256 \
     --batch_size 16 \
     --epochs 50 \
@@ -290,8 +322,87 @@ python src/training/train_world_model.py \
     --grad_clip 1.0
 ```
 
+**单站点训练（例如只训练Site A）**:
+```bash
+# 1. 预处理单站点数据
+python preprocess_multisite.py \
+    --raw_data_dir data/raw \
+    --output_dir data/processed_siteA \
+    --sites A \
+    --episode_length 80 \
+    --stride 15
+
+# 2. 训练单站点模型
+python src/training/train_world_model.py \
+    --train_data data/processed_siteA/train_episodes.npz \
+    --val_data data/processed_siteA/val_episodes.npz \
+    --checkpoint_dir checkpoints/world_model_siteA \
+    --input_dim 12 \
+    --continuous_dim 9 \
+    --latent_dim 256 \
+    --batch_size 16 \
+    --epochs 50 \
+    --lr 3e-4 \
+    --num_sites 1 \
+    --num_lanes 20 \
+    --use_site_id False
+```
+
+**单站点 vs 多站点参数对比**:
+| 参数 | 多站点 | 单站点 (Site A) | 说明 |
+|------|--------|----------------|------|
+| `--sites` | A B C D E F G H I | A | 预处理时指定站点 |
+| `--output_dir` | data/processed | data/processed_siteA | 单独的输出目录 |
+| `--num_sites` | 9 (默认) | 1 | 站点embedding数量 |
+| `--num_lanes` | ~150 | ~20 | 单站点车道数较少 |
+| `--use_site_id` | True (默认) | False | 单站点可禁用site_id特征 |
+| `--checkpoint_dir` | checkpoints/world_model | checkpoints/world_model_siteA | 避免冲突 |
+
+**单站点训练的适用场景**:
+- ✅ **快速原型验证**: 数据量小，训练速度快
+- ✅ **站点特异性研究**: 研究特定站点的交通模式
+- ✅ **计算资源受限**: 单站点数据量约为多站点的1/9
+- ✅ **迁移学习基线**: 可用于测试跨站点泛化能力
+
+**多站点训练的优势**:
+- ✅ **更强泛化性**: 学习跨站点的通用交通规律
+- ✅ **更多训练数据**: 9个站点数据联合训练
+- ✅ **站点条件化**: 模型能区分不同站点的特征
+- ✅ **更鲁棒**: 对单站点特殊情况不易过拟合
+
+**单站点训练示例（其他站点）**:
+```bash
+# Site B
+python preprocess_multisite.py --sites B --output_dir data/processed_siteB
+python src/training/train_world_model.py \
+    --train_data data/processed_siteB/train_episodes.npz \
+    --val_data data/processed_siteB/val_episodes.npz \
+    --checkpoint_dir checkpoints/world_model_siteB \
+    --num_sites 1 --num_lanes 25
+
+# Site C
+python preprocess_multisite.py --sites C --output_dir data/processed_siteC
+python src/training/train_world_model.py \
+    --train_data data/processed_siteC/train_episodes.npz \
+    --val_data data/processed_siteC/val_episodes.npz \
+    --checkpoint_dir checkpoints/world_model_siteC \
+    --num_sites 1 --num_lanes 18
+```
+
+**多站点组合训练示例**:
+```bash
+# 训练Site A + B + C的组合
+python preprocess_multisite.py --sites A B C --output_dir data/processed_ABC
+python src/training/train_world_model.py \
+    --train_data data/processed_ABC/train_episodes.npz \
+    --val_data data/processed_ABC/val_episodes.npz \
+    --checkpoint_dir checkpoints/world_model_ABC \
+    --num_sites 3 --num_lanes 60
+```
+
 **关键参数**:
-- `--input_dim 12`: **必须与metadata.json中的n_features一致**
+- `--input_dim 12`: **必须与metadata.json中的n_features一致** (输入维度)
+- `--continuous_dim 9`: 🔥 **v2.3新增** - Decoder输出的连续特征维度 (9个连续特征)
 - `--latent_dim 256`: 潜在空间维度（推荐128-512）
 - `--batch_size 16`: 根据GPU内存调整（默认16）
 - `--epochs 50`: 训练轮数
@@ -301,9 +412,15 @@ python src/training/train_world_model.py \
 - `--max_dynamics_len 512`: 最大序列长度
 - `--max_dynamics_context 128`: Rollout时的最大上下文长度
 
+**v2.3参数说明**:
+- `input_dim=12`: Encoder接收完整的12维特征（连续9维 + 离散3维）
+- `continuous_dim=9`: Decoder只输出9个连续特征 [0,1,2,3,4,5,6,9,10]
+- 离散特征 [7,8,11] 通过embedding条件化模型，不参与decoder输出
+
 ### 步骤3: 模型架构详解
 
 **整体架构**: Encoder → Transformer Dynamics → Decoder (with Kinematic Prior)
+**v2.3关键变化**: Decoder只输出9维连续特征，离散特征作为episode-level常量
 
 **完整的前向传播流程**:
 
@@ -315,7 +432,7 @@ python src/training/train_world_model.py \
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
   1. 特征分离 (forward L133-164)
-     # 将12维特征分为连续和离散特征
+     # 将12维特征分为连续(9维)和离散(3维)特征
 
      连续特征提取 (L139):
      ├─ continuous_indices = [0,1,2,3,4,5,6,9,10]  # 排除7,8,11
@@ -323,8 +440,9 @@ python src/training/train_world_model.py \
 
      离散特征embedding (L145-161):
      ├─ lane_id [8] → lane_embedding(nn.Embedding(num_lanes, 16))
-     ├─ class_id [7] → class_embedding(nn.Embedding(num_classes, 8))  # ← 新增
+     ├─ class_id [7] → class_embedding(nn.Embedding(num_classes, 8))
      └─ site_id [11] → site_embedding(nn.Embedding(num_sites, 8))
+     # ⚠️ 这些embedding仅用于条件化encoder，不参与decoder预测
 
   2. 连续特征投影 (L69-74)
      cont_emb = continuous_projector(cont)
@@ -403,7 +521,8 @@ python src/training/train_world_model.py \
 【src/models/decoder.py: StateDecoder】
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-  ⚠️ 重要新增: (x,y)残差头，用于物理先验修正
+  🔥 v2.3变化: 只输出连续特征(9维)，不输出离散特征
+  ⚠️ 重要特性: (x,y)残差头，用于物理先验修正
 
   1. MLP Backbone (forward L34-42, L81)
      h = backbone(latent)
@@ -413,17 +532,18 @@ python src/training/train_world_model.py \
      # )
      → [B, T, hidden_dim=256]
 
-  2. 绝对状态预测 (L45, L83)
-     states = state_head(h).view(B, T, K=50, F=12)
-     # Linear(256 → 50*12=600)
-     → [B, T, K, F]
+  2. 连续状态预测 (L45-47, L86) 🔥 NEW: continuous_dim=9
+     states = state_head(h).view(B, T, K=50, F_cont=9)
+     # Linear(256 → 50*9=450)  # 原来是50*12=600
+     # 只输出: [center_x, center_y, vx, vy, ax, ay, angle, has_preceding, has_following]
+     → [B, T, K, F_cont=9]  # 不包含class_id, lane_id, site_id
 
-  3. Existence Logits (L48, L84)
+  3. Existence Logits (L48, L87)
      existence_logits = existence_head(h)
      # Linear(256 → 50)
      → [B, T, K]
 
-  4. (x,y)残差头 (L51-57, L86-90) ← 新增
+  4. (x,y)残差头 (L51-57, L89-93)
      IF enable_xy_residual:
          residual_xy = residual_xy_head(h).view(B, T, K, 2)
          # Linear(256 → 50*2=100)
@@ -489,14 +609,17 @@ python src/training/train_world_model.py \
 
      # 其他特征 (vx,vy,ax,ay,angle等) 直接使用decoder输出
 
-  7. 返回 (L209-215)
+  7. 返回 (L209-215) 🔥 v2.3: 输出continuous-only
      return {
          "latent": latent,                          # [B,T,D]
-         "reconstructed_states": recon_states,      # [B,T,K,F]
-         "predicted_states": pred_states,           # [B,T,K,F] with prior+residual
+         "reconstructed_states": recon_states,      # [B,T,K,F_cont=9] 🔥 只有连续特征
+         "predicted_states": pred_states,           # [B,T,K,F_cont=9] with prior+residual
          "existence_logits": exist_logits,          # [B,T,K]
          "predicted_existence_logits": pred_exist_logits,  # [B,T,K]
      }
+
+     # ⚠️ 重要: 离散特征(class_id, lane_id, site_id)不在输出中
+     # 它们作为episode-level常量，在rollout时从initial_states复制
 ```
 
 **架构亮点**:
@@ -505,6 +628,8 @@ python src/training/train_world_model.py \
 3. ✅ **物理先验 + 学习残差**: 结合运动学方程和神经网络修正
 4. ✅ **三种embeddings**: Lane, Class, Site三种离散特征embedding
 5. ✅ **Normalization-aware**: 物理先验在原始空间计算，保证正确性
+6. 🔥 **v2.3 Continuous-Only Decoder**: Decoder只输出9个连续特征，离散特征作为常量
+7. 🔥 **Episode-Level Conditioning**: site_id等离散特征作为episode条件，不参与预测
 
 ### 步骤4: Loss计算详解
 
@@ -535,14 +660,18 @@ class WorldModelLoss(nn.Module):
 
     def _masked_huber_loss(self, pred, target, mask):
         """
-        L39-57: 仅对continuous_indices计算Huber loss
+        L39-59: 仅对continuous_indices计算Huber loss
+
+        🔥 v2.3变化:
+        - pred: [B,T,K,F_cont=9] 已经是连续特征（decoder直接输出）
+        - target: [B,T,K,F_full=12] 需要过滤到连续特征
         """
+        # 只过滤target，pred已经是continuous-only
         if self.continuous_indices is not None:
-            pred = pred[..., self.continuous_indices]    # ← 过滤到连续特征
-            target = target[..., self.continuous_indices]
+            target = target[..., self.continuous_indices]  # 12 → 9
 
         # Huber loss (beta=1.0)
-        diff = pred - target
+        diff = pred - target  # 现在两者都是 [B,T,K,9]
         abs_diff = diff.abs()
         loss = torch.where(
             abs_diff < beta,
@@ -585,18 +714,27 @@ if use_pred_existence_loss:
     )
 ```
 
-**为什么只对连续特征计算loss**:
+**为什么只对连续特征计算loss (v2.3架构设计理念)**:
 ```
+🔥 v2.3关键变化: Decoder根本不输出离散特征
+
 离散特征 (7, 8, 11):
 - class_id, lane_id, site_id是类别变量
-- 不应该用Huber/MSE回归
-- 模型通过embedding学习这些特征
-- 回归loss会误导学习方向 (把整数当连续值优化)
+- 不应该用Huber/MSE回归（v2.2认知）
+- 🔥 v2.3: Decoder直接不输出这些特征！
+- 作为episode-level常量，通过embedding条件化encoder
+- 预测时从initial_states复制，保持整个episode不变
 
 连续特征 (0-6, 9-10):
 - center_x, center_y, vx, vy, ax, ay, angle, has_preceding, has_following
 - 适合回归任务
 - Huber loss robust to outliers (相比MSE)
+- 🔥 v2.3: Decoder只输出这9个特征 [B,T,K,9]
+
+设计优势:
+✅ 避免模型"浪费"参数学习预测常量
+✅ Loss更纯粹，只关注真正需要预测的连续动态
+✅ 减少输出维度 (12→9)，提高效率
 ```
 
 **continuous_indices从哪里来**:
@@ -844,27 +982,31 @@ src/evaluation/rollout_eval.py
 
 **World Model Rollout详解**:
 
-**新rollout实现** (src/models/world_model.py L217-296):
+**新rollout实现** (src/models/world_model.py L224-330):
 
 ```python
 @torch.no_grad()
 def rollout(
-    initial_states,      # [B, T0=65, K, F]
+    initial_states,      # [B, T0=65, K, F=12] 包含全部特征（连续+离散）
     initial_masks,       # [B, T0, K]
+    continuous_indices,  # 🔥 v2.3新增: 连续特征索引 [0,1,2,3,4,5,6,9,10]
+    discrete_indices,    # 🔥 v2.3新增: 离散特征索引 [7,8,11]
     n_steps=15,          # 预测步数
     threshold=0.5,       # 存在性阈值
     teacher_forcing=False,
     ground_truth_states=None,
 ):
     """
-    🔥 新版rollout: 使用Transformer dynamics.step() + Kinematic Prior
+    🔥 v2.3版rollout: Continuous-Only Decoder + 离散特征常量
 
     关键改进:
     1. 使用dynamics.step()进行单步预测 (支持truncated context)
     2. 应用kinematic prior + residual修正(x,y)
     3. 累积latent历史 (用于Transformer的attention)
+    4. 🔥 NEW: Decoder只输出连续特征，离散特征从initial_states复制
+    5. 🔥 NEW: 重建完整状态用于kinematic prior计算
     """
-    B, T0, K, F = initial_states.shape
+    B, T0, K, F = initial_states.shape  # F=12 (全部特征)
 
     # 1. 编码context (L243)
     latent_ctx = encoder(initial_states, initial_masks)  # [B,T0,D]
@@ -874,49 +1016,66 @@ def rollout(
     pred_latent_ctx, _ = dynamics(latent_ctx, time_padding_mask=time_padding)
     current_latent = pred_latent_ctx[:, -1:, :]  # [B,1,D] 最后一步的预测
 
-    # 3. 初始化历史和状态 (L249-250)
-    latent_hist = latent_ctx          # 历史latent序列 [B,T0,D]
-    prev_state = initial_states[:, -1:, :, :]  # [B,1,K,F] 最后一帧
+    # 3. 🔥 v2.3新增: 提取离散特征模板 (L259-261)
+    discrete_template = initial_states[:, -1:, :, discrete_indices]  # [B,1,K,3]
+    # 离散特征 (class_id, lane_id, site_id) 在整个rollout中保持不变
 
-    out_states = []
+    # 4. 初始化历史和状态 (L269-270)
+    latent_hist = latent_ctx                     # 历史latent序列 [B,T0,D]
+    prev_state_full = initial_states[:, -1:, :, :]  # [B,1,K,F=12] 最后一帧完整状态
+
+    out_states = []  # 将存储连续特征 [F_cont=9]
     out_masks = []
 
-    # 4. Autoregressive rollout循环 (L255-292)
+    # 5. Autoregressive rollout循环 (L275-318)
     for step in range(n_steps):  # 15步
-        # a. 解码当前latent (L257-259)
-        base_states, exist_logits, residual_xy = decoder(
+        # a. 解码当前latent - 输出连续特征 (L276-279)
+        base_states_cont, exist_logits, residual_xy = decoder(
             current_latent,
-            return_residual_xy=True  # 获取(x,y)残差
+            return_residual_xy=True
         )
-        pred_state = base_states.clone()  # [B,1,K,F]
+        # base_states_cont: [B,1,K,F_cont=9] 只有连续特征
+        pred_state_cont = base_states_cont.clone()
 
-        # b. 🔥 应用kinematic prior (L262-266)
-        prior_xy = _kinematic_prior_xy(prev_state)  # [B,1,K,2]
-        # prior_xy基于prev_state的(vx,vy,ax,ay)计算物理预测
+        # b. 🔥 v2.3新增: 重建完整状态 (L281-285)
+        # Kinematic prior需要完整的12维状态来计算物理方程
+        pred_state_full = torch.zeros(B, 1, K, F, device=...)  # [B,1,K,12]
+        pred_state_full[..., continuous_indices] = pred_state_cont  # 填充连续特征
+        pred_state_full[..., discrete_indices] = discrete_template  # 填充离散常量
+
+        # c. 🔥 应用kinematic prior (L287-296)
+        prior_xy = _kinematic_prior_xy(prev_state_full)  # [B,1,K,2]
+        # 使用完整状态计算物理先验
 
         if residual_xy is not None:
-            pred_state[..., idx_x] = prior_xy[..., 0] + residual_xy[..., 0]
-            pred_state[..., idx_y] = prior_xy[..., 1] + residual_xy[..., 1]
+            # 找到x,y在continuous_indices中的位置
+            cont_idx_x = continuous_indices.index(idx_x)  # 0
+            cont_idx_y = continuous_indices.index(idx_y)  # 1
+            pred_state_cont[..., cont_idx_x] = prior_xy[..., 0] + residual_xy[..., 0]
+            pred_state_cont[..., cont_idx_y] = prior_xy[..., 1] + residual_xy[..., 1]
 
-        # c. 存在性mask (L269-270)
+        # d. 存在性mask (L298-300)
         exist_prob = torch.sigmoid(exist_logits)  # logits → prob
         pred_mask = (exist_prob > threshold).float()  # [B,1,K]
 
-        out_states.append(pred_state)
+        # e. 🔥 存储连续特征预测 (L302-304)
+        out_states.append(pred_state_cont)  # 只存储连续特征 [B,1,K,9]
         out_masks.append(pred_mask)
 
-        # d. 决定下一步的"prev_state" (L275-284)
+        # f. 决定下一步的"prev_state_full" (L306-318)
         if teacher_forcing and ground_truth_states is not None:
-            # 使用ground truth (用于训练阶段的scheduled sampling)
-            gt_state = ground_truth_states[:, T0+step:T0+step+1, :, :]
-            prev_state = gt_state
-            gt_mask = (gt_state.abs().sum(dim=-1) > 0).float()
-            current_latent = encoder(gt_state, gt_mask)
+            # 使用ground truth (完整状态)
+            gt_state_full = ground_truth_states[:, T0+step:T0+step+1, :, :]
+            prev_state_full = gt_state_full  # [B,1,K,12]
+            gt_mask = (gt_state_full.abs().sum(dim=-1) > 0).float()
+            current_latent = encoder(gt_state_full, gt_mask)
         else:
-            # 使用预测结果 (open-loop)
-            prev_state = pred_state * pred_mask.unsqueeze(-1)
+            # 使用预测结果 (重建完整状态)
+            pred_state_full_masked = pred_state_full.clone()
+            pred_state_full_masked[..., continuous_indices] = pred_state_cont * pred_mask.unsqueeze(-1)
+            prev_state_full = pred_state_full_masked  # [B,1,K,12]
 
-        # e. 累积latent历史，预测下一步 (L287-292)
+        # g. 累积latent历史，预测下一步 (L320-326)
         latent_hist = torch.cat([latent_hist, current_latent], dim=1)
         # latent_hist: [B, T0+step+1, D]
 
@@ -927,11 +1086,12 @@ def rollout(
 
         current_latent = next_latent
 
-    # 5. 拼接输出 (L294-296)
-    predicted_states = torch.cat(out_states, dim=1)  # [B,n_steps=15,K,F]
+    # 6. 🔥 拼接输出 - 连续特征only (L328-330)
+    predicted_states = torch.cat(out_states, dim=1)  # [B,n_steps=15,K,F_cont=9]
     predicted_masks = torch.cat(out_masks, dim=1)    # [B,n_steps,K]
 
     return predicted_states, predicted_masks
+    # ⚠️ 注意: 返回的是连续特征，离散特征不包含在内
 ```
 
 **关键架构特点**:
@@ -965,13 +1125,17 @@ def rollout(
    - Teacher forcing: 使用ground truth (训练时可用)
 
 **与旧版本的区别**:
-| 特性 | 旧版 (GRU/LSTM) | 新版 (Transformer) |
-|------|----------------|-------------------|
-| Dynamics | RNN hidden state | Latent历史序列 |
-| 单步预测 | `dynamics(current_latent, hidden)` | `dynamics.step(latent_hist, max_context=128)` |
-| 物理先验 | 无 | Kinematic prior + residual |
-| Context | Hidden state | Truncated latent history |
-| (x,y)预测 | 直接输出 | Prior + Residual |
+| 特性 | 旧版 (GRU/LSTM) | v2.2 (Transformer) | v2.3 (Continuous-Only) |
+|------|----------------|-------------------|----------------------|
+| Dynamics | RNN hidden state | Latent历史序列 | Latent历史序列 |
+| 单步预测 | `dynamics(current_latent, hidden)` | `dynamics.step(latent_hist, max_context=128)` | 同v2.2 |
+| 物理先验 | 无 | Kinematic prior + residual | 同v2.2 |
+| Context | Hidden state | Truncated latent history | 同v2.2 |
+| (x,y)预测 | 直接输出 | Prior + Residual | 同v2.2 |
+| **Decoder输出** | [B,T,K,12] | [B,T,K,12] | 🔥 [B,T,K,9] continuous-only |
+| **离散特征** | 一起预测 | 一起预测 | 🔥 作为常量，从initial复制 |
+| **状态重建** | 不需要 | 不需要 | 🔥 重建完整状态用于prior |
+| **返回值** | 12维 | 12维 | 🔥 9维连续特征 |
 
 ### 步骤2: 指标计算
 
@@ -1451,9 +1615,11 @@ src/evaluation/visualize_predictions.py:main()
 
 ## ⚠️ 重要说明
 
-### 1. 离散特征处理（关键！）
+### 1. 离散特征处理（关键！）🔥 v2.3更新
 
-**为什么重要**: 这是最常见的错误来源！
+**为什么重要**: 这是最常见的错误来源！v2.3彻底解决了离散特征问题。
+
+**🔥 v2.3架构 - Decoder不输出离散特征**:
 
 **数据加载时** (`src/data/dataset.py:_normalize_data`):
 ```python
@@ -1465,31 +1631,62 @@ states[..., continuous_indices] = continuous_feats
 # 离散特征 [7, 8, 11] 保持不变!
 ```
 
-**模型中** (`src/models/encoder.py`):
+**模型Encoder** (`src/models/encoder.py`):
 ```python
-# ✅ 离散特征通过Embedding学习
+# ✅ 离散特征通过Embedding学习，仅用于条件化encoder
 site_id = states[..., 11].long()       # 提取site_id
 lane_id = states[..., 8].long()        # 提取lane_id
+class_id = states[..., 7].long()       # 提取class_id
 
 site_embed = self.site_embedding(site_id)
 lane_embed = self.lane_embedding(lane_id)
-# 不参与连续特征的标准化!
+class_embed = self.class_embedding(class_id)
+# 用于特征融合，不参与decoder预测!
 ```
 
-**Loss计算时** (`src/training/losses.py`):
+**🔥 v2.3 Decoder** (`src/models/decoder.py`):
 ```python
-# ✅ 仅对连续特征计算回归loss
-continuous_indices = [0, 1, 2, 3, 4, 5, 6, 9, 10]
-
-recon_loss = huber_loss(
-    pred[..., continuous_indices],
-    target[..., continuous_indices],
-    mask
-)
-# 离散特征不参与loss计算!
+# ✅ Decoder只输出连续特征
+states = state_head(h).view(B, T, K, continuous_dim=9)
+# 输出: [center_x, center_y, vx, vy, ax, ay, angle, has_preceding, has_following]
+# 不输出: class_id, lane_id, site_id
 ```
 
-**错误示例** ❌:
+**🔥 v2.3 Loss计算** (`src/training/losses.py`):
+```python
+# ✅ 只过滤target，pred已经是continuous-only
+def _masked_huber_loss(pred, target, mask):
+    # pred: [B,T,K,9] - 已经是连续特征（decoder直接输出）
+    # target: [B,T,K,12] - 需要过滤到连续特征
+    target = target[..., continuous_indices]  # 12 → 9
+
+    loss = huber_loss(pred, target, mask)
+    # 离散特征根本不在pred中!
+```
+
+**🔥 v2.3 Rollout** (`src/models/world_model.py:rollout`):
+```python
+# ✅ 离散特征从initial_states复制
+discrete_template = initial_states[:, -1:, :, discrete_indices]  # [B,1,K,3]
+
+for step in range(n_steps):
+    # Decoder输出连续特征
+    pred_cont = decoder(latent)  # [B,1,K,9]
+
+    # 重建完整状态（用于kinematic prior）
+    pred_full[..., continuous_indices] = pred_cont
+    pred_full[..., discrete_indices] = discrete_template  # 保持不变
+```
+
+**v2.2 vs v2.3 对比**:
+| | v2.2 | v2.3 🔥 |
+|---|------|---------|
+| Decoder输出 | [B,T,K,12] 全部特征 | [B,T,K,9] 连续特征only |
+| 离散特征处理 | Loss时过滤掉 | Decoder根本不输出 |
+| Loss计算 | 过滤pred和target | 只过滤target |
+| Rollout | 预测全部12维 | 预测9维+复制3维 |
+
+**错误示例** ❌ (v2.2时代的问题，v2.3已解决):
 ```python
 # ❌ 错误: 对所有特征标准化
 states = (states - mean) / std  # lane_id=150变成了150.3!
@@ -1497,11 +1694,11 @@ states = (states - mean) / std  # lane_id=150变成了150.3!
 # ❌ 错误: 对离散特征计算回归loss
 loss = mse(pred[:, :, :, :], target[:, :, :, :])  # 包括lane_id!
 
-# ❌ 错误: 对lane_id做回归预测
-predicted_lane = 150.73  # 应该是整数!
+# ❌ 错误: Decoder输出离散特征
+predicted_lane = decoder_output[..., 8]  # v2.3中decoder不输出索引8!
 ```
 
-### 2. 输入维度匹配
+### 2. 输入维度匹配 🔥 v2.3更新
 
 **检查方法**:
 ```bash
@@ -1509,8 +1706,25 @@ predicted_lane = 150.73  # 应该是整数!
 cat data/processed/metadata.json | grep n_features
 # 输出: "n_features": 12
 
-# 2. 训练时必须匹配
-python src/training/train_world_model.py --input_dim 12 ...
+# 2. 🔥 v2.3训练时需要两个维度参数
+python src/training/train_world_model.py \
+    --input_dim 12 \           # Encoder输入维度
+    --continuous_dim 9 ...     # Decoder输出维度
+```
+
+**v2.3维度说明**:
+```
+输入: [B, T, K, 12]
+  ├─ Encoder接收全部12维特征
+  │   ├─ 连续特征 [0,1,2,3,4,5,6,9,10] → 9维
+  │   └─ 离散特征 [7,8,11] → 3维 (转为embedding)
+  ↓
+Encoder输出: [B, T, latent_dim]
+  ↓
+Dynamics: [B, T, latent_dim]
+  ↓
+Decoder输出: [B, T, K, 9]  🔥 只有连续特征
+  └─ 输出: [center_x, center_y, vx, vy, ax, ay, angle, has_preceding, has_following]
 ```
 
 **常见错误**:
@@ -1519,8 +1733,14 @@ python src/training/train_world_model.py --input_dim 12 ...
 python src/training/train_world_model.py --input_dim 11 ...
 # RuntimeError: Expected 11 features, got 12
 
-# ✅ 正确
+# ❌ 错误: 缺少continuous_dim参数（v2.3必需）
 python src/training/train_world_model.py --input_dim 12 ...
+# 会使用默认值，可能不正确
+
+# ✅ 正确 (v2.3)
+python src/training/train_world_model.py \
+    --input_dim 12 \
+    --continuous_dim 9 ...
 ```
 
 ### 3. Lane Token格式
@@ -1542,6 +1762,31 @@ cat data/processed/metadata.json | grep -A 10 lane_mapping
     ...
 }
 ```
+
+**单站点训练时如何确定num_lanes**:
+```bash
+# 预处理后查看metadata
+cat data/processed_siteA/metadata.json | grep num_lanes
+# 输出: "num_lanes": 19
+
+# 或者查看lane_mapping的长度
+cat data/processed_siteA/metadata.json | grep -A 100 lane_mapping | grep "A:" | wc -l
+# 输出: 19 (Site A的车道数)
+
+# 训练时使用该值
+python src/training/train_world_model.py \
+    --train_data data/processed_siteA/train_episodes.npz \
+    --num_lanes 19  # 使用metadata中的实际值
+```
+
+**各站点车道数参考** (实际以metadata.json为准):
+| 站点 | 大致车道数 | 备注 |
+|------|----------|------|
+| Site A | ~19 | A1-A6, B1-B7, C1-C5, crossroads1 |
+| Site B | ~25 | 包含多个crossroads |
+| Site C | ~18 | 较小站点 |
+| ... | ... | 预处理后查看metadata确认 |
+| **多站点** | ~150 | 所有站点车道union |
 
 ### 4. Rollout修复 (2025-12-14)
 
@@ -1707,6 +1952,13 @@ MIT License
 
 ---
 
-**项目版本**: 1.0 (Production Ready ✅)
+**项目版本**: 1.1 (v2.3 - Continuous-Only Decoder) ✅
 **最后更新**: 2025-12-14
 **状态**: 所有已知bug已修复
+
+**v2.3 更新内容 (2025-12-14)**:
+- 🔥 Decoder只输出9个连续特征，不再输出离散特征
+- 🔥 离散特征 (class_id, lane_id, site_id) 作为episode-level常量
+- 🔥 Loss计算仅在连续特征上进行，更纯粹高效
+- 🔥 Rollout支持连续特征预测 + 离散特征常量组合
+- 🔥 减少decoder输出维度 (12→9)，提升训练效率

@@ -297,11 +297,13 @@ class TrajectoryDataset(Dataset):
             Dictionary with:
                 - states: [T, K, F] (float32, normalized continuous + raw discrete)
                 - masks: [T, K] (float32)
-                - scene_id: scalar (int64)
+                - scene_id: scalar (int64) - site identifier (0=A, 1=B, ..., 8=I)
+                - site_id: scalar (int64) - alias for scene_id, used as episode-level conditioning
                 - discrete_features: [T, K, n_discrete] (int64, ready for embeddings)
         """
         states = self.states[idx]  # [T, K, F]
         masks = self.masks[idx]    # [T, K]
+        site_id = self.scene_ids[idx]  # scalar site identifier
 
         # ✅ FIX: Extract discrete features as separate LongTensor for embeddings
         if len(self.discrete_indices) > 0:
@@ -318,7 +320,8 @@ class TrajectoryDataset(Dataset):
         return {
             'states': states,                  # [T, K, F] - full state vector
             'masks': masks,                    # [T, K]
-            'scene_id': self.scene_ids[idx],   # scalar
+            'scene_id': site_id,               # scalar (backward compatibility)
+            'site_id': site_id,                # scalar (explicit site identifier for conditioning)
             'discrete_features': discrete_feats  # [T, K, n_discrete] - LongTensor for embeddings
         }
 

@@ -118,6 +118,7 @@ def compute_val_diagnostics(
     outputs: Dict[str, torch.Tensor],
     batch: Dict[str, torch.Tensor],
     feature_names: Dict[int, str],
+    continuous_indices: list,
     context_len: int = 65,
     pos_idx: tuple = (0, 1),
     vel_idx: tuple = (2, 3),
@@ -135,6 +136,7 @@ def compute_val_diagnostics(
             - "states": [B, T, K, F]
             - "masks": [B, T, K]
         feature_names: Dict mapping feature index to name
+        continuous_indices: List of indices for continuous features (e.g., [0,1,2,3,4,5,6,9,10])
         context_len: Length of context window (C)
         pos_idx: Indices of (x, y) features
         vel_idx: Indices of (vx, vy) features
@@ -153,51 +155,55 @@ def compute_val_diagnostics(
     R = T - C  # Rollout horizon
 
     # Split into context and future
-    gt_ctx = states[:, :C]          # [B, C, K, F]
-    m_ctx = masks[:, :C]            # [B, C, K]
-    gt_fut = states[:, C:C+R]       # [B, R, K, F]
-    m_fut = masks[:, C:C+R]         # [B, R, K]
+    # Filter ground truth to continuous features only (to match decoder output)
+    gt_ctx_full = states[:, :C]                              # [B, C, K, F_full]
+    gt_ctx = gt_ctx_full[..., continuous_indices]            # [B, C, K, F_cont]
+    m_ctx = masks[:, :C]                                     # [B, C, K]
 
-    recon_ctx = recon[:, :C]        # [B, C, K, F]
-    pred_fut = pred[:, :C]          # [B, C, K, F] - predicted states for times 1:C+1
+    gt_fut_full = states[:, C:C+R]                           # [B, R, K, F_full]
+    gt_fut = gt_fut_full[..., continuous_indices]            # [B, R, K, F_cont]
+    m_fut = masks[:, C:C+R]                                  # [B, R, K]
+
+    # Decoder outputs are already continuous-only [B, T, K, F_cont]
+    recon_ctx = recon[:, :C]                                 # [B, C, K, F_cont]
 
     # For prediction, we compare pred[:-1] with gt[1:] (one-step ahead)
     # But for rollout diagnostics, we want to compare future predictions
     # pred[:, C-1] predicts state at time C (first future state)
-    pred_rollout = pred[:, C-1:C-1+R]  # [B, R, K, F]
+    pred_rollout = pred[:, C-1:C-1+R]                        # [B, R, K, F_cont]
 
     m_ctx_f = m_ctx.unsqueeze(-1)   # [B, C, K, 1]
     m_fut_f = m_fut.unsqueeze(-1)   # [B, R, K, 1]
 
-    recon_abs = (recon_ctx - gt_ctx).abs()
-    pred_abs = (pred_rollout - gt_fut).abs()
+    # Now both predictions and targets are continuous-only, same dimensions
+    recon_abs_cont = (recon_ctx - gt_ctx).abs()              # [B, C, K, F_cont]
+    pred_abs_cont = (pred_rollout - gt_fut).abs()            # [B, R, K, F_cont]
 
     diag = {}
 
-    # ========== (A) Per-feature MAE ==========
     recon_mae_f = _safe_div(
-        (recon_abs * m_ctx_f).sum(dim=(0, 1, 2)),
+        (recon_abs_cont * m_ctx_f).sum(dim=(0, 1, 2)),
         m_ctx_f.sum(dim=(0, 1, 2))
     )
     pred_mae_f = _safe_div(
-        (pred_abs * m_fut_f).sum(dim=(0, 1, 2)),
+        (pred_abs_cont * m_fut_f).sum(dim=(0, 1, 2)),
         m_fut_f.sum(dim=(0, 1, 2))
     )
 
-    # Convert to named dict
+    # Convert to named dict (only continuous features)
     diag["recon_mae_per_feature"] = {
-        feature_names.get(i, f"f{i}"): float(recon_mae_f[i])
-        for i in range(F)
+        feature_names.get(continuous_indices[i], f"f{continuous_indices[i]}"): float(recon_mae_f[i])
+        for i in range(len(continuous_indices))
     }
     diag["pred_mae_per_feature"] = {
-        feature_names.get(i, f"f{i}"): float(pred_mae_f[i])
-        for i in range(F)
+        feature_names.get(continuous_indices[i], f"f{continuous_indices[i]}"): float(pred_mae_f[i])
+        for i in range(len(continuous_indices))
     }
 
-    # ========== (B) Per-timestep MAE for rollout ==========
+    # ========== (B) Per-timestep MAE for rollout (CONTINUOUS ONLY) ==========
     pred_mae_t = _safe_div(
-        (pred_abs * m_fut_f).sum(dim=(0, 2, 3)),
-        m_fut_f.sum(dim=(0, 2, 3))
+        (pred_abs_cont * m_fut_f).sum(dim=(0, 2, 3)),
+        (m_fut_f.sum(dim=(0, 2, 3)) * len(continuous_indices))
     )
     diag["pred_mae_per_step"] = pred_mae_t.detach().cpu().tolist()
 
@@ -271,6 +277,7 @@ def evaluate(
     device: str,
     context_len: int = 65,
     feature_names: Dict[int, str] = None,
+    continuous_indices: list = None,
     compute_diagnostics: bool = True,
 ) -> Dict[str, float]:
     """
@@ -283,6 +290,7 @@ def evaluate(
         device: Device to use
         context_len: Context length (C)
         feature_names: Dict mapping feature index to name
+        continuous_indices: List of indices for continuous features
         compute_diagnostics: Whether to compute detailed diagnostics
 
     Returns:
@@ -313,11 +321,12 @@ def evaluate(
         n += bs
 
         # Compute diagnostics
-        if compute_diagnostics and feature_names is not None:
+        if compute_diagnostics and feature_names is not None and continuous_indices is not None:
             diag = compute_val_diagnostics(
                 preds,
                 {"states": states, "masks": masks},
                 feature_names,
+                continuous_indices,
                 context_len=context_len,
             )
 
@@ -406,14 +415,25 @@ def main() -> None:
     num_classes = int(meta.get("num_classes", 10))
     context_len = int(meta.get("context_length", 65))
 
-    # Extract feature names for diagnostics
+    # Extract feature names and continuous indices for diagnostics
     feature_layout = meta.get("feature_layout", {})
     feature_names = {int(k): v for k, v in feature_layout.items()}
+    continuous_indices = train_loader.dataset.continuous_indices
+    discrete_indices = train_loader.dataset.discrete_indices
+
+    # Log feature classification
+    logger.info("=" * 60)
+    logger.info("Feature Classification:")
+    logger.info(f"  Continuous features ({len(continuous_indices)}): {[feature_names[i] for i in continuous_indices]}")
+    logger.info(f"  Discrete features ({len(discrete_indices)}): {[feature_names[i] for i in discrete_indices]}")
+    logger.info(f"  NOTE: MAE metrics will ONLY be computed for continuous features")
+    logger.info("=" * 60)
 
     device = args.device
 
     model = WorldModel(
         input_dim=args.input_dim,
+        continuous_dim=len(continuous_indices),  # Only continuous features are decoded
         max_agents=args.max_agents,
         latent_dim=args.latent_dim,
         dynamics_layers=args.dynamics_layers,
@@ -476,6 +496,7 @@ def main() -> None:
             model, val_loader, loss_fn, device,
             context_len=context_len,
             feature_names=feature_names,
+            continuous_indices=continuous_indices,
             compute_diagnostics=True
         )
         val_loss = val_metrics["total_loss"]

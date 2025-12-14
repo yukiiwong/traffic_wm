@@ -28,6 +28,7 @@ class WorldModel(nn.Module):
     def __init__(
         self,
         input_dim: int = 12,
+        continuous_dim: int = 9,  # Number of continuous features (excluding discrete class/lane/site IDs)
         max_agents: int = 50,
         latent_dim: int = 256,
         dynamics_layers: int = 4,
@@ -57,6 +58,7 @@ class WorldModel(nn.Module):
         super().__init__()
 
         self.input_dim = input_dim
+        self.continuous_dim = continuous_dim
         self.max_agents = max_agents
         self.latent_dim = latent_dim
         self.dt = float(dt)
@@ -92,11 +94,12 @@ class WorldModel(nn.Module):
             max_len=max_dynamics_len,
         )
 
-        # Decoder: MLP decoder + residual_xy head
+        # Decoder: MLP decoder + residual_xy head (outputs only continuous features)
         self.decoder = StateDecoder(
             latent_dim=latent_dim,
             hidden_dim=latent_dim,
             output_dim=input_dim,
+            continuous_dim=continuous_dim,
             max_agents=max_agents,
             enable_xy_residual=True,
         )
@@ -173,16 +176,19 @@ class WorldModel(nn.Module):
     def forward(self, states: torch.Tensor, masks: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args:
-            states: [B, T, K, F] (normalized continuous + discrete as float)
+            states: [B, T, K, F] (normalized continuous + discrete as float) - FULL input including discrete features
             masks:  [B, T, K]     (0/1)
 
         Returns:
             dict with:
               - latent: [B,T,D]
-              - reconstructed_states: [B,T,K,F]
-              - predicted_states: [B,T,K,F]  (one-step-ahead; loss typically uses [:,:-1] vs target[:,1:])
+              - reconstructed_states: [B,T,K,F_cont]  (CONTINUOUS FEATURES ONLY, F_cont=9)
+              - predicted_states: [B,T,K,F_cont]  (CONTINUOUS FEATURES ONLY)
               - existence_logits: [B,T,K]    (for reconstructed states)
               - predicted_existence_logits: [B,T,K] (for predicted states)
+
+        Note: Decoder now outputs ONLY continuous features. Discrete features (class_id, lane_id, site_id)
+              are used as conditioning inputs via embeddings, not predicted as outputs.
         """
         B, T, K, F = states.shape
         assert F == self.input_dim, f"Expected F={self.input_dim}, got {F}"
@@ -219,6 +225,8 @@ class WorldModel(nn.Module):
         self,
         initial_states: torch.Tensor,
         initial_masks: torch.Tensor,
+        continuous_indices: List[int],
+        discrete_indices: List[int],
         n_steps: int = 20,
         threshold: float = 0.5,
         teacher_forcing: bool = False,
@@ -228,18 +236,30 @@ class WorldModel(nn.Module):
         Roll out future predictions.
 
         Args:
-            initial_states: [B, T0, K, F]
+            initial_states: [B, T0, K, F] - FULL states (continuous + discrete)
             initial_masks:  [B, T0, K]
+            continuous_indices: List of indices for continuous features
+            discrete_indices: List of indices for discrete features
             n_steps: number of steps to predict forward
             threshold: existence threshold
             teacher_forcing: if True, use ground_truth_states as the "prev" for next step
             ground_truth_states: [B, T0+n_steps, K, F] (same normalization as input)
 
         Returns:
-            predicted_states: [B, n_steps, K, F]
+            predicted_states: [B, n_steps, K, F_cont] - CONTINUOUS features only
             predicted_masks:  [B, n_steps, K]
+
+        Note:
+            - Decoder outputs continuous features only [F_cont=9]
+            - Discrete features (class_id, lane_id, site_id) are kept constant from initial_states
+            - For kinematic prior, we reconstruct full states by combining continuous + discrete
         """
         B, T0, K, F = initial_states.shape
+
+        # Extract constant discrete features (site_id, class_id, lane_id) from initial states
+        # These will remain constant throughout rollout
+        discrete_template = initial_states[:, -1:, :, discrete_indices]  # [B, 1, K, n_discrete]
+
         latent_ctx = self.encoder(initial_states, initial_masks)  # [B,T0,D]
         time_padding = (initial_masks.sum(dim=-1) == 0)  # [B,T0]
 
@@ -247,41 +267,55 @@ class WorldModel(nn.Module):
         current_latent = pred_latent_ctx[:, -1:, :]  # latent for time T0 (1-step after last context)
 
         latent_hist = latent_ctx  # history up to T0-1
-        prev_state = initial_states[:, -1:, :, :]  # state at time T0-1
+        prev_state_full = initial_states[:, -1:, :, :]  # FULL state at time T0-1 [B,1,K,F]
 
-        out_states = []
+        out_states = []  # Will contain continuous features only [F_cont]
         out_masks = []
 
         for step in range(n_steps):
-            # decode latent for current time step
-            base_states, exist_logits, residual_xy = self.decoder(current_latent, return_residual_xy=True)
-            # base_states: [B,1,K,F], residual_xy: [B,1,K,2]
-            pred_state = base_states.clone()
+            # Decode latent - outputs CONTINUOUS features only
+            base_states_cont, exist_logits, residual_xy = self.decoder(current_latent, return_residual_xy=True)
+            # base_states_cont: [B,1,K,F_cont=9], residual_xy: [B,1,K,2]
+            pred_state_cont = base_states_cont.clone()
 
-            # prior from prev_state (which corresponds to time t-1)
-            prior_xy = self._kinematic_prior_xy(prev_state)  # [B,1,K,2]
+            # Reconstruct FULL state for kinematic prior (continuous + discrete)
+            # Kinematic prior needs all features to compute physics properly
+            pred_state_full = torch.zeros(B, 1, K, F, device=base_states_cont.device, dtype=base_states_cont.dtype)
+            pred_state_full[..., continuous_indices] = pred_state_cont
+            pred_state_full[..., discrete_indices] = discrete_template  # Keep discrete constant
 
+            # Compute kinematic prior using FULL state (prev_state_full has all features)
+            prior_xy = self._kinematic_prior_xy(prev_state_full)  # [B,1,K,2]
+
+            # Apply residual to (x,y) in continuous prediction
             if residual_xy is not None:
-                pred_state[..., self.idx_x] = prior_xy[..., 0] + residual_xy[..., 0]
-                pred_state[..., self.idx_y] = prior_xy[..., 1] + residual_xy[..., 1]
+                # Find x,y positions in continuous_indices
+                cont_idx_x = continuous_indices.index(self.idx_x)
+                cont_idx_y = continuous_indices.index(self.idx_y)
+                pred_state_cont[..., cont_idx_x] = prior_xy[..., 0] + residual_xy[..., 0]
+                pred_state_cont[..., cont_idx_y] = prior_xy[..., 1] + residual_xy[..., 1]
 
-            # existence mask
+            # Existence mask
             exist_prob = torch.sigmoid(exist_logits)  # logits -> prob
             pred_mask = (exist_prob > threshold).float()  # [B,1,K]
 
-            out_states.append(pred_state)
+            # Store CONTINUOUS predictions only
+            out_states.append(pred_state_cont)
             out_masks.append(pred_mask)
 
             # Decide "prev" for next step
             if teacher_forcing and ground_truth_states is not None:
-                # use ground-truth at this predicted time
-                gt_state = ground_truth_states[:, T0 + step:T0 + step + 1, :, :]
-                prev_state = gt_state
-                # infer mask (padding should be 0)
-                gt_mask = (gt_state.abs().sum(dim=-1) > 0).float()
-                current_latent = self.encoder(gt_state, gt_mask)
+                # Use ground-truth at this predicted time (full features)
+                gt_state_full = ground_truth_states[:, T0 + step:T0 + step + 1, :, :]
+                prev_state_full = gt_state_full
+                # Infer mask (padding should be 0)
+                gt_mask = (gt_state_full.abs().sum(dim=-1) > 0).float()
+                current_latent = self.encoder(gt_state_full, gt_mask)
             else:
-                prev_state = pred_state * pred_mask.unsqueeze(-1)
+                # Reconstruct full state for next iteration
+                pred_state_full_masked = pred_state_full.clone()
+                pred_state_full_masked[..., continuous_indices] = pred_state_cont * pred_mask.unsqueeze(-1)
+                prev_state_full = pred_state_full_masked
 
             # append current_latent to history, then predict next latent
             latent_hist = torch.cat([latent_hist, current_latent], dim=1)
@@ -291,6 +325,6 @@ class WorldModel(nn.Module):
             ).view(B, 1, -1)
             current_latent = next_latent
 
-        predicted_states = torch.cat(out_states, dim=1)  # [B,n_steps,K,F]
+        predicted_states = torch.cat(out_states, dim=1)  # [B,n_steps,K,F_cont] continuous only
         predicted_masks = torch.cat(out_masks, dim=1)    # [B,n_steps,K]
         return predicted_states, predicted_masks
