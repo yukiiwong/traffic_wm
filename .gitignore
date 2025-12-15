@@ -161,3 +161,17 @@ CLAUDE.md
 *.rar
 *.7z
 nul
+
+# data artifacts
+data/processed_siteA/
+data/processed/
+*.npz
+*.pth
+*.pt
+*.ckpt
+*.h5
+
+# logs / outputs
+logs/
+runs/
+wandb/
