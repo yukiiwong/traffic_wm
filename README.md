@@ -31,8 +31,6 @@
    - 对 has_preceding/has_following 应用 sigmoid 激活
    - 更准确的二值特征预测
 
-详见：[IMPLEMENTATION_COMPLETE.md](IMPLEMENTATION_COMPLETE.md)
-
 ---
 
 ## 📋 目录
@@ -61,7 +59,7 @@
 3:  vy             - y 方向速度
 4:  ax             - x 方向加速度
 5:  ay             - y 方向加速度
-6:  angle          - 朝向角（单独 head 处理）
+6:  angle          - 朝向角（弧度，不归一化）
 7:  class_id       - 车辆类别（离散）
 8:  lane_id        - 车道ID（离散）
 9:  has_preceding  - 是否有前车（二值）
@@ -69,7 +67,7 @@
 11: site_id        - 站点ID（离散）
 ```
 
-**连续特征数**: 8 (去除 angle 和 3 个离散特征)
+**连续特征数**: 8 (0-6 共7个 + has_preceding + has_following，去除3个离散特征: class_id, lane_id, site_id)
 
 ### 增强特征模式（20 维）⭐ 推荐
 
@@ -93,8 +91,6 @@
 - ✅ 改进跟车、变道场景预测
 - ✅ 位置/速度 MAE 预期降低 10-25%
 
-详见：[RELATIVE_FEATURES_GUIDE.md](RELATIVE_FEATURES_GUIDE.md)
-
 ---
 
 ## 🚀 快速开始
@@ -102,15 +98,16 @@
 ### 环境安装
 
 ```bash
-# Python 3.10+
+# Python 3.9+ (推荐 3.10 或 3.11)
 pip install -r requirements.txt
 ```
 
 **核心依赖**:
+- Python >= 3.9
 - PyTorch >= 2.0.0
 - NumPy >= 1.24.0
 - Pandas >= 2.0.0
-- tqdm, matplotlib, seaborn, opencv-python
+- tqdm, matplotlib, seaborn
 
 ### 完整流程（4步）
 
@@ -378,8 +375,6 @@ data/processed/
 
 **连续预测特征**: 16 维
 
-详见：[RELATIVE_FEATURES_GUIDE.md](RELATIVE_FEATURES_GUIDE.md)
-
 #### 特征处理架构
 
 **v2.3 关键架构 (Continuous-Only Decoder)**:
@@ -394,8 +389,6 @@ data/processed/
 - ❌ Z-score归一化破坏周期性: `-π` 和 `π` 是同一方向
 - ✅ **解决方案**: Angle 保持原始弧度值，不做归一化
 - ✅ **元数据配置**: `angle_idx: 6` 添加到 `validation_info`
-
-详见：[ANGLE_IMPROVEMENT_GUIDE.md](ANGLE_IMPROVEMENT_GUIDE.md)
 
 **🔥 二值特征处理** 🆕 v2.4:
 
@@ -416,16 +409,13 @@ python src/data/validate_preprocessing.py
 ```
 
 **检查项**:
-```python
-# validate_preprocessing.py 检查:
-✅ 1. 元数据一致性 (fps=30, T=80, C=65, H=15)
-✅ 2. Lane token格式 ("site:lane")
-✅ 3. Train/Val/Test时序无重叠
-✅ 4. 离散特征未被标准化 🆕 v2.4
-✅ 5. Angle索引配置正确 🆕 v2.4
-✅ 6. 特征维度正确 (F=12或20)
-✅ 7. Episode数量合理
-```
+- ✅ 元数据一致性 (fps=30, T=80, C=65, H=15)
+- ✅ Lane token格式 ("site:lane")
+- ✅ Train/Val/Test时序无重叠
+- ✅ 离散特征未被标准化
+- ✅ Angle索引配置正确
+- ✅ 特征维度正确 (F=12或20)
+- ✅ Episode数量合理
 
 **期望输出**:
 ```
@@ -560,7 +550,7 @@ python src/training/train_world_model.py \
 
 **关键参数**:
 - `--input_dim 12`: 输入维度（必须与metadata.json中的n_features一致）
-- `--continuous_dim 9`: Decoder输出的连续特征维度
+- `--continuous_dim 8`: Decoder输出的连续特征维度（12维模式）或1 or 16（20维模式）
 - `--latent_dim 256`: 潜在空间维度（推荐128-512）
 - `--batch_size 16`: 根据GPU内存调整（默认16）
 - `--epochs 50`: 训练轮数
@@ -571,14 +561,16 @@ python src/training/train_world_model.py \
 - `--max_dynamics_context 128`: Rollout时的最大上下文长度
 
 **参数说明**:
-- `input_dim=12`: Encoder接收完整的12维特征（连续9维 + 离散3维）
-- `continuous_dim=9`: Decoder输出9个连续特征 [0,1,2,3,4,5,6,9,10]
-- 离散特征 [7,8,11] 通过embedding条件化模型，不参与decoder输出
+- `input_dim=12/20`: Encoder接收完整的12维或20维特征
+- `continuous_dim=8/16`: Decoder输出8个（12维模式）或16个（20维模式）连续特征
+  - 12维模式: 输出 [0,1,2,3,4,5,6,9,10] 共9个，但angle(6)单独处理，实际连续输出8个
+  - 20维模式: 增加8个相对特征，连续输出16个
+- 离散特征 [7,8,11] (class_id, lane_id, site_id) 通过embedding条件化模型，不参与decoder输出
 
 ### 步骤3: 模型架构详解
 
 **整体架构**: Encoder → Transformer Dynamics → Decoder (with Kinematic Prior)
-**v2.3关键变化**: Decoder只输出9维连续特征，离散特征作为episode-level常量
+**v2.3关键变化**: Decoder只输出8维连续特征（12维模式）或16维（20维模式），离散特征作为episode-level常量
 
 **完整的前向传播流程**:
 
@@ -595,6 +587,7 @@ python src/training/train_world_model.py \
      连续特征提取 (L139):
      ├─ continuous_indices = [0,1,2,3,4,5,6,9,10]  # 排除7,8,11
      └─ cont = states[..., continuous_indices]  # [B, T, K, 9]
+     # 注意: angle(6) 保留在连续特征中，但不被归一化
 
      离散特征embedding (L145-161):
      ├─ lane_id [8] → lane_embedding(nn.Embedding(num_lanes, 16))
@@ -787,40 +780,16 @@ python src/training/train_world_model.py \
 
 **使用的代码文件**: `src/training/losses.py`
 
-**Loss组成** (WorldModelLoss L67-109):
-```python
-total_loss = recon_weight * recon_loss +        # 重建loss
-             pred_weight * pred_loss +           # 预测loss
-             exist_weight * (exist_loss +        # 存在性loss (重建)
-                            pred_exist_loss)     # 存在性loss (预测)
-```
+**Loss组成**:
+- **重建Loss**: 重建当前帧的连续特征
+- **预测Loss**: 预测下一帧的连续特征
+- **存在性Loss**: 预测车辆是否存在（mask）
+- **总Loss** = recon_weight × recon_loss + pred_weight × pred_loss + exist_weight × exist_loss
 
-**关键实现**:
-
-```python
-class WorldModelLoss(nn.Module):
-    def __init__(
-        self,
-        recon_weight: float = 1.0,
-        pred_weight: float = 1.0,
-        exist_weight: float = 0.1,
-        huber_beta: float = 1.0,  # Huber loss平滑参数
-        continuous_indices: Optional[List[int]] = None,  # ← 关键
-        use_pred_existence_loss: bool = True,
-    ):
-        ...
-
-    def _masked_huber_loss(self, pred, target, mask):
-        """
-        L39-59: 仅对continuous_indices计算Huber loss
-
-        🔥 v2.3变化:
-        - pred: [B,T,K,F_cont=9] 已经是连续特征（decoder直接输出）
-        - target: [B,T,K,F_full=12] 需要过滤到连续特征
-        """
-        # 只过滤target，pred已经是continuous-only
-        if self.continuous_indices is not None:
-            target = target[..., self.continuous_indices]  # 12 → 9
+**关键特性**:
+- 仅对连续特征计算 Huber Loss
+- 离散特征不参与loss计算
+- Decoder输出已经是连续特征，target需要过滤
 
         # Huber loss (beta=1.0)
         diff = pred - target  # 现在两者都是 [B,T,K,9]
@@ -836,29 +805,14 @@ class WorldModelLoss(nn.Module):
         return loss.sum() / (mask.sum() * loss.shape[-1]).clamp(min=1.0)
 ```
 
-**Loss计算流程** (forward L67-109):
+**Loss计算流程**:
 
-```python
-# 1. 重建loss (L86): 对齐当前帧
-recon_loss = _masked_huber_loss(
-    recon_states,  # decoder(latent)
-    states,        # ground truth
-    masks
-)
-
-# 2. 预测loss (L89): t预测t+1
-#    ⚠️ 时间对齐很关键
-pred_loss = _masked_huber_loss(
-    pred_states[:, :-1],  # 预测: t=0到t=T-2
-    states[:, 1:],        # 目标: t=1到t=T-1
-    masks[:, :-1]         # mask对齐
-)
-
-# 3. 存在性loss (L91): 重建分支
-exist_loss = _existence_loss(exist_logits, masks)
-# BCEWithLogitsLoss: sigmoid(logits) vs ground truth masks
-
-# 4. 预测存在性loss (L94-95): 预测分支
+1. **重建loss**: decoder(latent) vs ground truth (对齐当前帧)
+2. **预测loss**: t预测t+1 (时间对齐很关键)
+   - 预测: t=0到t=T-2
+   - 目标: t=1到t=T-1
+3. **存在性loss**: BCEWithLogitsLoss (sigmoid(logits) vs ground truth masks)
+4. **预测存在性loss**: 预测分支
 if use_pred_existence_loss:
     pred_exist_loss = _existence_loss(
         predicted_existence_logits[:, :-1],  # 时间对齐
@@ -878,17 +832,10 @@ if use_pred_existence_loss:
 - 适合回归任务，Huber loss对outliers鲁棒
 - Decoder只输出这9个特征 [B,T,K,9]
 
-**continuous_indices从哪里来**:
-```python
-# train_world_model.py L154
-continuous_indices = train_loader.dataset.continuous_indices
-# 由dataset.py从metadata.json读取
-
-# dataset.py自动计算:
-discrete_features = {lane_idx=8, class_idx=7, site_idx=11}
-continuous_indices = [i for i in range(12) if i not in discrete_features]
-# → [0, 1, 2, 3, 4, 5, 6, 9, 10]
-```
+**continuous_indices配置**:
+- 由 dataset.py 从 metadata.json 自动读取
+- 自动计算：排除离散特征索引 {7, 8, 11}
+- 结果：[0, 1, 2, 3, 4, 5, 6, 9, 10]
 
 ### 步骤5: 训练流程详解
 
@@ -896,32 +843,14 @@ continuous_indices = [i for i in range(12) if i not in discrete_features]
 
 **主要流程**:
 
-```python
-def main():
-    # 1. 解析参数 (L30-56)
-    args = parse_args()
-
-    # 2. 创建TRAIN loader并计算normalization stats (L96-106)
-    train_loader = get_dataloader(
-        args.train_data,
-        batch_size=args.batch_size,
-        shuffle=True,
-        normalize=True,
-        stats_path=None  # 首次运行，自动计算stats
-    )
-
-    # 保存normalization stats (用于VAL/TEST)
-    stats_path = ckpt_dir / "normalization_stats.npz"
-    if not stats_path.exists():
-        train_loader.dataset.save_stats(str(stats_path))
-
-    # 3. 创建VAL loader (复用TRAIN的stats) (L108-116)
-    val_loader = get_dataloader(
-        args.val_data,
-        batch_size=args.batch_size,
-        shuffle=False,
-        normalize=True,
-        stats_path=str(stats_path)  # ← 使用TRAIN的stats
+1. **解析参数** - 从命令行读取训练配置
+2. **创建数据加载器**:
+   - Train loader: 自动计算 normalization stats
+   - Val loader: 复用 train 的 normalization stats
+3. **创建模型** - WorldModel with Encoder, Dynamics, Decoder
+4. **设置优化器** - AdamW + Learning Rate Scheduler
+5. **训练循环** - Forward → Loss → Backward → Update
+6. **验证和保存** - 每个 epoch 后验证并保存最佳模型
     )
 
     # 4. 从metadata读取配置 (L118-123)
@@ -1010,24 +939,15 @@ def main():
             save_checkpoint(ckpt_dir / "checkpoint_best.pt", ...)
 ```
 
-**Checkpoint保存内容** (save_checkpoint L59-68):
-```python
-{
-    "epoch": epoch,
-    "model_state_dict": model.state_dict(),
-    "optimizer_state_dict": optimizer.state_dict(),
-}
-```
+**Checkpoint保存内容**:
+- epoch: 训练轮数
+- model_state_dict: 模型参数
+- optimizer_state_dict: 优化器状态
 
-**Normalization stats保存** (dataset.py):
-```python
-# checkpoints/world_model/normalization_stats.npz:
-{
-    "mean": [n_continuous],  # 仅连续特征的mean
-    "std": [n_continuous],   # 仅连续特征的std
-    "continuous_indices": [0,1,2,3,4,5,6,9,10],
-}
-```
+**Normalization stats保存**:
+- mean: 连续特征的均值
+- std: 连续特征的标准差
+- continuous_indices: 连续特征索引列表
 
 ### 步骤6: 监控训练
 
@@ -1123,25 +1043,14 @@ src/evaluation/rollout_eval.py
 
 **World Model Rollout详解**:
 
-**Rollout流程** (src/models/world_model.py L224-330):
+**Rollout流程** (src/models/world_model.py):
 
-```python
-@torch.no_grad()
-def rollout(
-    initial_states,      # [B, T0=65, K, F=12]
-    initial_masks,       # [B, T0, K]
-    continuous_indices,  # [0,1,2,3,4,5,6,9,10]
-    discrete_indices,    # [7,8,11]
-    n_steps=15,
-    threshold=0.5,
-    teacher_forcing=False,
-):
-    # 1. 编码context
-    latent_ctx = encoder(initial_states, initial_masks)
-    
-    # 2. 通过dynamics预测
-    pred_latent_ctx, _ = dynamics(latent_ctx)
-    current_latent = pred_latent_ctx[:, -1:, :]
+**步骤**:
+1. **编码Context**: 使用encoder编码初始65帧
+2. **Dynamics预测**: 通过dynamics模型预测潜在状态
+3. **循环生成**: 逐步预测未来15帧
+4. **解码状态**: 使用decoder将潜在状态解码为车辆状态
+5. **组合特征**: 连续特征来自decoder，离散特征从初始状态复制
     
     # 3. 提取离散特征模板（保持不变）
     discrete_template = initial_states[:, -1:, :, discrete_indices]
@@ -1178,32 +1087,19 @@ def rollout(
 
 **指标详解**:
 
-```python
-# prediction_metrics.py: compute_all_metrics (L257-319)
+**compute_all_metrics** (prediction_metrics.py):
 
-def compute_all_metrics(predicted, ground_truth, masks, convert_to_meters=True):
-    """
-    计算所有评估指标
+计算所有评估指标:
+1. ADE (Average Displacement Error) - 平均位移误差
+2. FDE (Final Displacement Error) - 最终位移误差
+3. Velocity Error - 速度误差
+4. Heading Error - 航向误差
+5. Collision Rate - 碰撞率
 
-    指标列表:
-    1. ADE (Average Displacement Error)  - L18-50
-    2. FDE (Final Displacement Error)    - L53-86
-    3. Velocity Error                     - L89-121
-    4. Heading Error                      - L124-160
-    5. Collision Rate                     - L163-217
-    """
-
-    # 坐标转换 (L282-301)
-    if convert_to_meters:
-        # 使用src/utils/common.py:convert_pixels_to_meters
-        pixel_to_meter = get_pixel_to_meter_conversion()  # ≈ 0.077
-
-        predicted = convert_pixels_to_meters(
-            predicted,
-            pixel_to_meter,
-            position_indices=(0, 1),
-            velocity_indices=(2, 3),
-            acceleration_indices=(4, 5)
+**坐标转换**:
+- 使用 src/utils/common.py:convert_pixels_to_meters
+- pixel_to_meter ≈ 0.077
+- 转换位置、速度、加速度特征
         )
         ground_truth = convert_pixels_to_meters(ground_truth, ...)
 
@@ -1219,49 +1115,23 @@ def compute_all_metrics(predicted, ground_truth, masks, convert_to_meters=True):
     return metrics
 ```
 
-**ADE/FDE计算**:
-```python
-# ADE: 平均位移误差 (L18-50)
-def compute_ade(predicted, ground_truth, masks):
-    # 提取位置 (x, y)
-    pred_pos = predicted[..., :2]  # [B, T, K, 2]
-    gt_pos = ground_truth[..., :2]
+**ADE (平均位移误差)**:
+- 提取预测和真值位置 (x, y)
+- 计算 L2 距离
+- 应用mask并求平均
+- 单位: 米
 
-    # L2距离
-    displacement = torch.norm(pred_pos - gt_pos, dim=-1)  # [B, T, K]
-
-    # 应用mask并求平均
-    masked_displacement = displacement * masks
-    ade = masked_displacement.sum() / masks.sum().clamp(min=1)
-
-    return ade.item()  # 单位: 米
-
-# FDE: 最终位移误差 (L53-86)
-def compute_fde(predicted, ground_truth, masks):
-    # 仅最后一帧
-    pred_final = predicted[:, -1, :, :2]  # [B, K, 2]
-    gt_final = ground_truth[:, -1, :, :2]
-    mask_final = masks[:, -1, :]
-
-    # L2距离
-    displacement = torch.norm(pred_final - gt_final, dim=-1)
-
-    # 平均
-    fde = (displacement * mask_final).sum() / mask_final.sum().clamp(min=1)
-
-    return fde.item()  # 单位: 米
-```
+**FDE (最终位移误差)**:
+- 仅最后一帧
+- 计算预测和真值的 L2 距离
+- 单位: 米
 
 **期望结果** (良好模型):
-```json
-{
-  "ade": 0.10,          // 10厘米平均误差
-  "fde": 0.12,          // 12厘米最终误差
-  "velocity_error": 0.08,   // 8cm/s速度误差
-  "heading_error": 1.5,     // 1.5度朝向误差
-  "collision_rate": 5.2     // 5.2% (取决于safety_margin)
-}
-```
+- ADE: 0.10 (10厘米平均误差)
+- FDE: 0.12 (12厘米最终误差)
+- velocity_error: 0.08 (8cm/s速度误差)
+- heading_error: 1.5 (1.5度朝向误差)
+- collision_rate: 5.2 (5.2% 取决于safety_margin)
 
 ---
 
@@ -1349,44 +1219,12 @@ src/evaluation/visualize_predictions.py
     └── site_I_sample_5.jpg
 ```
 
-**绘制函数详解**:
-```python
-# visualize_predictions.py: draw_trajectory_on_image (L58-106)
+**draw_trajectory_on_image** (visualize_predictions.py):
 
-def draw_trajectory_on_image(img, trajectory, color, thickness=2):
-    """
-    在图像上绘制单条轨迹
-
-    参数:
-        img: 航拍图 [H, W, 3]
-        trajectory: [T, 2] 轨迹坐标 (像素)
-        color: (R, G, B) 颜色
-    """
-    import cv2
-
-    # 过滤无效点
-    valid_mask = (trajectory[:, 0] > 0) & (trajectory[:, 1] > 0)
-    trajectory = trajectory[valid_mask]
-
-    # 绘制连线
-    for i in range(len(trajectory) - 1):
-        pt1 = (int(trajectory[i, 0]), int(trajectory[i, 1]))
-        pt2 = (int(trajectory[i+1, 0]), int(trajectory[i+1, 1]))
-        cv2.line(img, pt1, pt2, color, thickness)
-
-    # 绘制点
-    for pt in trajectory:
-        cv2.circle(img, (int(pt[0]), int(pt[1])), 3, color, -1)
-
-    # 起点: 大圆圈
-    cv2.circle(img, (int(trajectory[0, 0]), int(trajectory[0, 1])), 6, color, 2)
-
-    # 终点: 方块
-    end_pt = (int(trajectory[-1, 0]), int(trajectory[-1, 1]))
-    cv2.rectangle(img, (end_pt[0]-4, end_pt[1]-4), (end_pt[0]+4, end_pt[1]+4), color, -1)
-
-    return img
-```
+使用 OpenCV 在航拍图上绘制轨迹:
+- 输入: 航拍图 + 轨迹坐标(像素) + 颜色
+- 过滤无效点
+- 绘制连线、起点圆圈、终点方块
 
 **可视化结果示例**:
 ```
@@ -1430,9 +1268,9 @@ python src/evaluation/attention_visualization.py \
 
 ```
 traffic_wm/
-├── 📄 README.md                        # 本文件 - 用户指南
-├── 📄 CLAUDE.md                        # 开发者指南 (详细技术说明)
-├── 📄 WORLD_MODEL_COMPARISON.md        # 与DreamerV3的架构对比
+├── 📄 README.md                        # 本文件 - 完整用户指南
+├── 📄 DATA_GUIDE.md                    # 数据格式详解
+├── 📄 CODE_DOCUMENTATION.md            # 代码结构和API文档
 ├── 📄 requirements.txt                 # Python依赖
 │
 ├── � tests/                           # 测试文件 🆕
@@ -1586,72 +1424,35 @@ traffic_wm/
 
 ### 关键函数调用链
 
-**训练时**:
-```python
-src/training/train_world_model.py:main()
-  └─ Trainer.__init__()
-      ├─ src/data/dataset.py:TrajectoryDataset(normalize=True)
-      ├─ src/models/world_model.py:WorldModel()
-      │   ├─ src/models/encoder.py:MultiAgentEncoder()
-      │   ├─ src/models/dynamics.py:LatentDynamics()
-      │   └─ src/models/decoder.py:StateDecoder()
-      └─ src/training/losses.py:WorldModelLoss()
+**可视化流程**:
 
-  └─ Trainer.train()
-      └─ for epoch in range(n_epochs):
-          ├─ Trainer.train_epoch()
-          │   └─ for batch in train_loader:
-          │       ├─ model.forward(states, masks)
-          │       ├─ loss_fn(predictions, targets)
-          │       └─ optimizer.step()
-          │
-          ├─ Trainer.validate()
-          └─ Trainer.save_checkpoint()
-```
+1. **训练时**:
+   - 初始化: TrajectoryDataset (normalize=True) + WorldModel + WorldModelLoss
+   - 训练循环: forward → loss → backward → update
+   - 验证与保存: validate() → save_checkpoint()
 
-**评估时**:
-```python
-src/evaluation/rollout_eval.py:main()
-  ├─ 加载checkpoint
-  ├─ 创建WorldModel
-  ├─ 创建TrajectoryDataset(test)
-  │
-  └─ evaluate_rollout()
-      └─ for batch in test_loader:
-          ├─ model.rollout(context, n_steps=15)
-          │   ├─ encoder(context) → latent
-          │   ├─ dynamics(latent) → predicted_latent_context
-          │   └─ for step in range(15):
-          │       ├─ dynamics(current_latent) → next_latent
-          │       ├─ decoder(next_latent) → next_states
-          │       └─ current_latent = next_latent
-          │
-          └─ src/evaluation/prediction_metrics.py:compute_all_metrics()
-              ├─ compute_ade()
-              ├─ compute_fde()
-              ├─ compute_velocity_error()
-              └─ ...
-```
+2. **评估时**:
+   - 加载 checkpoint 和 WorldModel
+   - 创建 test dataset
+   - 对每个 batch:
+     - model.rollout(context, n_steps=15)
+     - compute_all_metrics(预测, 真值, masks)
 
-**可视化时**:
-```python
-src/evaluation/visualize_predictions.py:main()
-  ├─ 加载checkpoint
-  ├─ 加载站点图片
-  ├─ 创建TrajectoryDataset(test, normalize=False)
-  │
-  └─ visualize_batch_predictions()
-      └─ for batch in test_loader:
-          ├─ 分割context/target
-          ├─ normalize_states(context) → context_norm
-          ├─ model.rollout(context_norm) → predictions_norm
-          ├─ denormalize_states(predictions_norm) → predictions
-          │
-          └─ for agent in agents:
-              ├─ draw_trajectory(context, color=blue)
-              ├─ draw_trajectory(target, color=green)
-              └─ draw_trajectory(predictions, color=red)
-```
+3. **可视化时**:
+   - 加载 checkpoint 和站点图片
+   - 创建 test dataset (normalize=False)
+   - 对每个 batch:
+     - 分割 context/target
+     - 标准化 context → model.rollout
+     - 反标准化 → 绘制轨迹
+
+3. **可视化时**:
+   - 加载 checkpoint 和站点图片
+   - 创建 test dataset (normalize=False)
+   - 对每个 batch:
+     - 分割 context/target
+     - 标准化 context → model.rollout
+     - 反标准化 → 绘制轨迹
 
 ---
 
@@ -1663,62 +1464,31 @@ src/evaluation/visualize_predictions.py:main()
 
 **🔥 v2.3架构 - Decoder不输出离散特征**:
 
-**数据加载时** (`src/data/dataset.py:_normalize_data`):
-```python
-# ✅ 正确做法
-continuous_feats = states[..., continuous_indices]  # [0,1,2,3,4,5,6,9,10]
-continuous_feats = (continuous_feats - mean) / std
+**数据归一化** (src/data/dataset.py):
+- 仅对连续特征进行 z-score 归一化
+- 离散特征 [7, 8, 11] 保持原始值不变
+- Angle 特征保持原始弧度值（不归一化）
 
-states[..., continuous_indices] = continuous_feats
-# 离散特征 [7, 8, 11] 保持不变!
-```
+**模型Encoder** (src/models/encoder.py):
+- 离散特征通过 Embedding 层学习
+- Site/Lane/Class embeddings 用于条件化编码器
+- 这些特征不参与decoder预测，仅影响潜在表示
 
-**模型Encoder** (`src/models/encoder.py`):
-```python
-# ✅ 离散特征通过Embedding学习，仅用于条件化encoder
-site_id = states[..., 11].long()       # 提取site_id
-lane_id = states[..., 8].long()        # 提取lane_id
-class_id = states[..., 7].long()       # 提取class_id
+**Decoder输出** (src/models/decoder.py):
+- 只输出连续特征维度: 8 (12维模式) 或 16 (20维模式)
+- 输出特征: center_x, center_y, vx, vy, ax, ay, angle, has_preceding, has_following
+- 不输出离散特征: class_id, lane_id, site_id
 
-site_embed = self.site_embedding(site_id)
-lane_embed = self.lane_embedding(lane_id)
-class_embed = self.class_embedding(class_id)
-# 用于特征融合，不参与decoder预测!
-```
+**Loss计算** (src/training/losses.py):
+- pred: decoder直接输出的连续特征
+- target: 需要过滤到连续特征索引
+- 只对连续特征计算 Huber Loss
+- 离散特征不参与loss计算
 
-**🔥 v2.3 Decoder** (`src/models/decoder.py`):
-```python
-# ✅ Decoder只输出连续特征
-states = state_head(h).view(B, T, K, continuous_dim=9)
-# 输出: [center_x, center_y, vx, vy, ax, ay, angle, has_preceding, has_following]
-# 不输出: class_id, lane_id, site_id
-```
-
-**🔥 v2.3 Loss计算** (`src/training/losses.py`):
-```python
-# ✅ 只过滤target，pred已经是continuous-only
-def _masked_huber_loss(pred, target, mask):
-    # pred: [B,T,K,9] - 已经是连续特征（decoder直接输出）
-    # target: [B,T,K,12] - 需要过滤到连续特征
-    target = target[..., continuous_indices]  # 12 → 9
-
-    loss = huber_loss(pred, target, mask)
-    # 离散特征根本不在pred中!
-```
-
-**🔥 v2.3 Rollout** (`src/models/world_model.py:rollout`):
-```python
-# ✅ 离散特征从initial_states复制
-discrete_template = initial_states[:, -1:, :, discrete_indices]  # [B,1,K,3]
-
-for step in range(n_steps):
-    # Decoder输出连续特征
-    pred_cont = decoder(latent)  # [B,1,K,9]
-
-    # 重建完整状态（用于kinematic prior）
-    pred_full[..., continuous_indices] = pred_cont
-    pred_full[..., discrete_indices] = discrete_template  # 保持不变
-```
+**Rollout实现** (src/models/world_model.py):
+- 离散特征从初始状态复制，在整个rollout过程中保持不变
+- Decoder每步输出连续特征
+- 重建完整状态时，连续部分来自decoder，离散部分复制模板
 
 ### 2. 输入维度匹配
 
@@ -2034,7 +1804,7 @@ MIT License
 **项目版本**: v2.4 🆕 ✅
 
 **更新日志**:
-- **v2.4** (2024):
+- **v2.4** (2025):
   - ✅ 添加相对位置特征（8维）
   - ✅ Learning Rate Scheduler (cosine/step/plateau)
   - ✅ Angle优化（修复归一化，添加angle_idx）
