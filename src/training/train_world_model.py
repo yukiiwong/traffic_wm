@@ -42,11 +42,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", "--learning_rate", type=float, default=3e-4, dest="lr")
     p.add_argument("--weight_decay", type=float, default=1e-4)
     p.add_argument("--grad_clip", type=float, default=1.0)
+    p.add_argument("--scheduler", type=str, default="cosine", choices=["none", "cosine", "step", "plateau"],
+                   help="Learning rate scheduler: none, cosine, step, or plateau")
+    p.add_argument("--lr_min", type=float, default=1e-6, help="Minimum LR for cosine scheduler")
 
     # loss weights
     p.add_argument("--recon_weight", type=float, default=1.0)
     p.add_argument("--pred_weight", type=float, default=1.0)
     p.add_argument("--existence_weight", type=float, default=0.1)
+    p.add_argument("--angle_weight", type=float, default=0.5, help="Weight for angle loss")
 
     # logging
     p.add_argument("--log_dir", type=str, default="logs/world_model")
@@ -472,7 +476,7 @@ def main() -> None:
         recon_weight=args.recon_weight,
         pred_weight=args.pred_weight,
         exist_weight=args.existence_weight,
-        angle_weight=0.5,  # Weight for angle loss
+        angle_weight=args.angle_weight,
         huber_beta=1.0,
         continuous_indices=train_loader.dataset.continuous_indices,
         angle_idx=angle_idx,
@@ -480,6 +484,26 @@ def main() -> None:
     )
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    
+    # Setup learning rate scheduler
+    scheduler = None
+    if args.scheduler == "cosine":
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.lr_min
+        )
+        logger.info(f"Using CosineAnnealingLR scheduler (eta_min={args.lr_min})")
+    elif args.scheduler == "step":
+        scheduler = optim.lr_scheduler.StepLR(
+            optimizer, step_size=args.epochs // 3, gamma=0.1
+        )
+        logger.info("Using StepLR scheduler (step_size=epochs/3, gamma=0.1)")
+    elif args.scheduler == "plateau":
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode='min', factor=0.5, patience=5, verbose=True
+        )
+        logger.info("Using ReduceLROnPlateau scheduler (patience=5, factor=0.5)")
+    else:
+        logger.info("No learning rate scheduler")
 
     best_val = float("inf")
 
@@ -583,6 +607,15 @@ def main() -> None:
             logger.info("  [PRED MAE PER FEATURE]")
             for name, val in sorted_pred:
                 logger.info(f"    {name:15s}: {val:.4f}")
+
+        # Update learning rate scheduler
+        if scheduler is not None:
+            if args.scheduler == "plateau":
+                scheduler.step(val_loss)
+            else:
+                scheduler.step()
+            current_lr = optimizer.param_groups[0]['lr']
+            logger.info(f"  [LR] Current learning rate: {current_lr:.6f}")
 
         # Save diagnostics to JSON
         diag_json_path = Path(args.log_dir) / f"val_diag_epoch_{epoch+1:04d}.json"

@@ -25,6 +25,7 @@ class StateDecoder(nn.Module):
         dropout: float = 0.1,
         enable_xy_residual: bool = True,
         enable_angle_head: bool = True,  # Separate head for angle (periodic, non-normalized)
+        binary_feature_indices: list = None,  # Indices of binary features (for sigmoid)
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -34,6 +35,9 @@ class StateDecoder(nn.Module):
         self.max_agents = max_agents
         self.enable_xy_residual = enable_xy_residual
         self.enable_angle_head = enable_angle_head
+        # Binary features: has_preceding (6), has_following (7) in continuous output (9 features)
+        # After removing discrete (class_id, lane_id, site_id) and angle from full 12 features
+        self.binary_feature_indices = binary_feature_indices if binary_feature_indices is not None else [6, 7]
 
         self.backbone = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
@@ -98,6 +102,13 @@ class StateDecoder(nn.Module):
 
         # Output only continuous features (excluding angle)
         states = self.state_head(h).view(B, T, self.max_agents, self.continuous_dim)  # [B, T, K, F_cont]
+        
+        # Apply sigmoid to binary features (has_preceding, has_following)
+        if self.binary_feature_indices:
+            for idx in self.binary_feature_indices:
+                if 0 <= idx < self.continuous_dim:
+                    states[..., idx] = torch.sigmoid(states[..., idx])
+        
         existence_logits = self.existence_head(h)  # [B, T, K]
 
         residual_xy = None

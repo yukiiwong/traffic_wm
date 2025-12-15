@@ -17,7 +17,7 @@ import shutil
 import pandas as pd
 
 # Get project root and add to path
-PROJECT_ROOT = Path(__file__).parent
+PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data.split_strategy import MultiSiteDataSplitter, chronological_split_episodes

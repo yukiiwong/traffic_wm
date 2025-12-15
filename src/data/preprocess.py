@@ -214,6 +214,7 @@ def extract_fixed_stride_episodes(
     use_extended_features: bool = False,
     use_acceleration: bool = False,
     use_site_id: bool = False,
+    use_relative_features: bool = True,  # Add relative position/velocity features
 ) -> List[Dict[str, np.ndarray]]:
     """
     Extract fixed-stride episodes from continuous segments.
@@ -252,6 +253,7 @@ def extract_fixed_stride_episodes(
                 use_extended_features=use_extended_features,
                 use_acceleration=use_acceleration,
                 use_site_id=use_site_id,
+                use_relative_features=use_relative_features,
             )
 
             # Add metadata about segment and global timing
@@ -272,8 +274,7 @@ def extract_single_episode_from_global(
     max_vehicles: int,
     use_extended_features: bool = False,
     use_acceleration: bool = False,
-    use_site_id: bool = False,
-) -> Dict[str, np.ndarray]:
+    use_site_id: bool = False,    use_relative_features: bool = True,) -> Dict[str, np.ndarray]:
     """
     Extract a single episode using global_frame instead of original frame.
 
@@ -303,6 +304,8 @@ def extract_single_episode_from_global(
             F = 10
     if use_site_id:
         F += 1
+    if use_relative_features:
+        F += 8  # preceding (dx, dy, dvx, dvy) + following (dx, dy, dvx, dvy)
 
     states = np.zeros((T, max_vehicles, F), dtype=np.float32)
     masks = np.zeros((T, max_vehicles), dtype=np.float32)
@@ -373,6 +376,36 @@ def extract_single_episode_from_global(
             if use_site_id:
                 states[t, k, feature_idx] = float(site_id)
                 feature_idx += 1
+
+            # Relative features (preceding and following vehicle)
+            if use_relative_features:
+                # Preceding vehicle relative features
+                if 'preceding_id' in row and not pd.isna(row['preceding_id']):
+                    prec_id = row['preceding_id']
+                    prec_data = frame_data[frame_data['global_track_id'] == prec_id]
+                    if len(prec_data) > 0:
+                        prec = prec_data.iloc[0]
+                        states[t, k, feature_idx] = prec['center_x'] - row['center_x']  # dx
+                        states[t, k, feature_idx+1] = prec['center_y'] - row['center_y']  # dy
+                        states[t, k, feature_idx+2] = prec['vx'] - row['vx']  # dvx
+                        states[t, k, feature_idx+3] = prec['vy'] - row['vy']  # dvy
+                    # else: keep zeros
+                # else: keep zeros (no preceding vehicle)
+                feature_idx += 4
+
+                # Following vehicle relative features
+                if 'following_id' in row and not pd.isna(row['following_id']):
+                    foll_id = row['following_id']
+                    foll_data = frame_data[frame_data['global_track_id'] == foll_id]
+                    if len(foll_data) > 0:
+                        foll = foll_data.iloc[0]
+                        states[t, k, feature_idx] = foll['center_x'] - row['center_x']  # dx
+                        states[t, k, feature_idx+1] = foll['center_y'] - row['center_y']  # dy
+                        states[t, k, feature_idx+2] = foll['vx'] - row['vx']  # dvx
+                        states[t, k, feature_idx+3] = foll['vy'] - row['vy']  # dvy
+                    # else: keep zeros
+                # else: keep zeros (no following vehicle)
+                feature_idx += 4
 
             # Mark as valid
             masks[t, k] = 1.0
@@ -485,6 +518,7 @@ def extract_single_episode(
     use_extended_features: bool = False,
     use_acceleration: bool = False,
     use_site_id: bool = False,
+    use_relative_features: bool = True,
 ) -> Dict[str, np.ndarray]:
 
     """
@@ -570,14 +604,45 @@ def extract_single_episode(
                         (~frame_data['following_id'].isna()).astype(float).values[:n_vehicles]
                 feature_idx += 1
 
-            # Store track IDs
-            track_ids[t, :n_vehicles] = frame_data['track_id'].values[:n_vehicles]
-            masks[t, :n_vehicles] = 1.0
             # Site feature (if enabled) — use the same site_id for all vehicles in this episode
             if use_site_id:
                 # feature_idx currently points to the next free feature slot
                 states[t, :n_vehicles, feature_idx] = float(site_id)
                 feature_idx += 1
+
+            # Relative features (preceding and following vehicle)
+            if use_relative_features:
+                for k in range(n_vehicles):
+                    vehicle_row = frame_data.iloc[k]
+                    
+                    # Preceding vehicle relative features
+                    if 'preceding_id' in frame_data.columns and not pd.isna(vehicle_row['preceding_id']):
+                        prec_id = vehicle_row['preceding_id']
+                        prec_data = frame_data[frame_data['track_id'] == prec_id]
+                        if len(prec_data) > 0:
+                            prec = prec_data.iloc[0]
+                            states[t, k, feature_idx] = prec['center_x'] - vehicle_row['center_x']
+                            states[t, k, feature_idx+1] = prec['center_y'] - vehicle_row['center_y']
+                            states[t, k, feature_idx+2] = prec['vx'] - vehicle_row['vx']
+                            states[t, k, feature_idx+3] = prec['vy'] - vehicle_row['vy']
+                    # Preceding features at feature_idx:feature_idx+4
+                    
+                    # Following vehicle relative features
+                    foll_feature_idx = feature_idx + 4
+                    if 'following_id' in frame_data.columns and not pd.isna(vehicle_row['following_id']):
+                        foll_id = vehicle_row['following_id']
+                        foll_data = frame_data[frame_data['track_id'] == foll_id]
+                        if len(foll_data) > 0:
+                            foll = foll_data.iloc[0]
+                            states[t, k, foll_feature_idx] = foll['center_x'] - vehicle_row['center_x']
+                            states[t, k, foll_feature_idx+1] = foll['center_y'] - vehicle_row['center_y']
+                            states[t, k, foll_feature_idx+2] = foll['vx'] - vehicle_row['vx']
+                            states[t, k, foll_feature_idx+3] = foll['vy'] - vehicle_row['vy']
+                    # Following features at foll_feature_idx:foll_feature_idx+4
+
+            # Store track IDs and masks
+            track_ids[t, :n_vehicles] = frame_data['track_id'].values[:n_vehicles]
+            masks[t, :n_vehicles] = 1.0
 
     # Extract scene_id from site column
     # Use the derived site_id as scene_id for this episode
@@ -774,6 +839,7 @@ def preprocess_single_site_with_global_timeline(
         use_extended_features=use_extended_features,
         use_acceleration=use_acceleration,
         use_site_id=use_site_id,
+        use_relative_features=use_relative_features,
     )
 
     split_info = f" ({split_name})" if split_name else ""
@@ -792,6 +858,7 @@ def preprocess_trajectories(
     use_extended_features: bool = False,
     use_acceleration: bool = False,
     use_site_id: bool = False,
+    use_relative_features: bool = True,
     split_data: bool = False,
     train_ratio: float = 0.7,
     val_ratio: float = 0.15,
@@ -940,6 +1007,57 @@ def preprocess_trajectories(
             F = max(F + 3, 10)  # base + lane/preceding/following, at least 10
         if use_site_id:
             F += 1  # Extra dim for site_id
+        if use_relative_features:
+            F += 8  # preceding (dx, dy, dvx, dvy) + following (dx, dy, dvx, dvy)
+
+        # Build feature layout mapping
+        feature_layout = {}
+        idx = 0
+        feature_layout[str(idx)] = "center_x"; idx += 1
+        feature_layout[str(idx)] = "center_y"; idx += 1
+        feature_layout[str(idx)] = "vx"; idx += 1
+        feature_layout[str(idx)] = "vy"; idx += 1
+        
+        if use_acceleration:
+            feature_layout[str(idx)] = "ax"; idx += 1
+            feature_layout[str(idx)] = "ay"; idx += 1
+        
+        feature_layout[str(idx)] = "angle"; idx += 1
+        angle_idx = idx - 1  # Remember angle index
+        feature_layout[str(idx)] = "class_id"; idx += 1
+        class_id_idx = idx - 1
+        
+        if use_extended_features:
+            feature_layout[str(idx)] = "lane_id"; idx += 1
+            lane_id_idx = idx - 1
+            feature_layout[str(idx)] = "has_preceding"; idx += 1
+            feature_layout[str(idx)] = "has_following"; idx += 1
+        
+        if use_site_id:
+            feature_layout[str(idx)] = "site_id"; idx += 1
+            site_id_idx = idx - 1
+        
+        if use_relative_features:
+            feature_layout[str(idx)] = "preceding_rel_x"; idx += 1
+            feature_layout[str(idx)] = "preceding_rel_y"; idx += 1
+            feature_layout[str(idx)] = "preceding_rel_vx"; idx += 1
+            feature_layout[str(idx)] = "preceding_rel_vy"; idx += 1
+            feature_layout[str(idx)] = "following_rel_x"; idx += 1
+            feature_layout[str(idx)] = "following_rel_y"; idx += 1
+            feature_layout[str(idx)] = "following_rel_vx"; idx += 1
+            feature_layout[str(idx)] = "following_rel_vy"; idx += 1
+
+        # Discrete features
+        discrete_features = {"class_id": class_id_idx}
+        do_not_normalize = ["class_id", "angle"]
+        
+        if use_extended_features:
+            discrete_features["lane_id"] = lane_id_idx
+            do_not_normalize.append("lane_id")
+        
+        if use_site_id:
+            discrete_features["site_id"] = site_id_idx
+            do_not_normalize.append("site_id")
 
         metadata = {
             'n_episodes': len(all_episodes),
@@ -951,6 +1069,13 @@ def preprocess_trajectories(
             'use_extended_features': use_extended_features,
             'use_acceleration': use_acceleration,
             'use_site_id': use_site_id,
+            'use_relative_features': use_relative_features,
+            'feature_layout': feature_layout,
+            'validation_info': {
+                'discrete_features': discrete_features,
+                'do_not_normalize': do_not_normalize,
+                'angle_idx': angle_idx,
+            },
             'lane_mapping': lane_mapping if use_extended_features else {},
             'statistics': stats
         }
@@ -976,6 +1101,7 @@ if __name__ == '__main__':
         fps=30.0,
         use_extended_features=True,  # Enable lane + relationship features
         use_acceleration=False,       # Optional: add acceleration
+        use_relative_features=True,   # Enable relative position/velocity features
         split_data=True,              # Split into train/val/test
         save_metadata=True            # Save metadata JSON
     )

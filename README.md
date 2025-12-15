@@ -5,24 +5,95 @@
 **核心特性**:
 - 🚁 多站点无人机数据支持 (Sites A-I)
 - 🧠 Transformer编码器 + Transformer时序动力学 + 物理先验
-- 🎯 12维输入特征 → 9维连续特征预测 + Site/Lane/Class embeddings
+- 🎯 支持 12 维基础特征 或 20 维增强特征（含相对位置/速度）
 - ⏱️ 时序无重叠的train/val/test划分
 - 🔧 完整的预处理、训练、评估流程
-- 🔥 v2.3: Decoder只输出连续特征，离散特征作为episode-level常量
+- 🔥 v2.4: 添加相对位置特征、Learning Rate Scheduler、Angle优化
+- 🎓 v2.3: Decoder只输出连续特征，离散特征作为episode-level常量
+
+---
+
+## 🆕 最新更新 (v2.4)
+
+### 新增功能
+
+1. **相对位置特征** ⭐
+   - 新增 8 个相对特征：前车/后车的相对位置和速度
+   - 提升车辆交互场景的预测准确度
+   - 特征总数：12 → 20
+
+2. **训练优化**
+   - 添加 Learning Rate Scheduler (Cosine/Step/Plateau)
+   - 可调节的 angle_weight 参数
+   - 修复 angle 归一化问题（添加 angle_idx 到 metadata）
+
+3. **二值特征改进**
+   - 对 has_preceding/has_following 应用 sigmoid 激活
+   - 更准确的二值特征预测
+
+详见：[IMPLEMENTATION_COMPLETE.md](IMPLEMENTATION_COMPLETE.md)
 
 ---
 
 ## 📋 目录
 
 1. [快速开始](#-快速开始)
-2. [数据预处理](#-数据预处理)
-3. [模型训练](#-模型训练)
-4. [模型评估](#-模型评估)
-5. [可视化](#-可视化)
-6. [项目结构](#-项目结构)
-7. [代码文件详解](#-代码文件详解)
-8. [重要说明](#-重要说明)
-9. [故障排查](#-故障排查)
+2. [特征说明](#-特征说明)
+3. [数据预处理](#-数据预处理)
+4. [模型训练](#-模型训练)
+5. [模型评估](#-模型评估)
+6. [可视化](#-可视化)
+7. [项目结构](#-项目结构)
+8. [代码文件详解](#-代码文件详解)
+9. [重要说明](#-重要说明)
+10. [故障排查](#-故障排查)
+
+---
+
+## 🎯 特征说明
+
+### 基础特征模式（12 维）
+
+```
+0:  center_x       - 车辆中心 x 坐标
+1:  center_y       - 车辆中心 y 坐标
+2:  vx             - x 方向速度
+3:  vy             - y 方向速度
+4:  ax             - x 方向加速度
+5:  ay             - y 方向加速度
+6:  angle          - 朝向角（单独 head 处理）
+7:  class_id       - 车辆类别（离散）
+8:  lane_id        - 车道ID（离散）
+9:  has_preceding  - 是否有前车（二值）
+10: has_following  - 是否有后车（二值）
+11: site_id        - 站点ID（离散）
+```
+
+**连续特征数**: 8 (去除 angle 和 3 个离散特征)
+
+### 增强特征模式（20 维）⭐ 推荐
+
+在基础特征基础上添加：
+
+```
+12: preceding_rel_x   - 前车相对 x 距离
+13: preceding_rel_y   - 前车相对 y 距离
+14: preceding_rel_vx  - 前车相对 x 速度
+15: preceding_rel_vy  - 前车相对 y 速度
+16: following_rel_x   - 后车相对 x 距离
+17: following_rel_y   - 后车相对 y 距离
+18: following_rel_vx  - 后车相对 x 速度
+19: following_rel_vy  - 后车相对 y 速度
+```
+
+**连续特征数**: 16
+
+**优势**:
+- ✅ 直接建模车辆间距和速度差
+- ✅ 改进跟车、变道场景预测
+- ✅ 位置/速度 MAE 预期降低 10-25%
+
+详见：[RELATIVE_FEATURES_GUIDE.md](RELATIVE_FEATURES_GUIDE.md)
 
 ---
 
@@ -43,24 +114,27 @@ pip install -r requirements.txt
 
 ### 完整流程（4步）
 
-**多站点训练（全部9个站点）**:
+#### 方案 1: 多站点基础训练（12 维特征）
+
 ```bash
 # 1. 数据预处理
-python preprocess_multisite.py
+python src/data/preprocess_multisite.py
 
 # 2. 验证数据
-python validate_preprocessing.py
+python src/data/validate_preprocessing.py
 
 # 3. 训练模型
 python src/training/train_world_model.py \
     --train_data data/processed/train_episodes.npz \
     --val_data data/processed/val_episodes.npz \
     --input_dim 12 \
-    --continuous_dim 9 \
+    --continuous_dim 8 \
     --latent_dim 256 \
     --batch_size 16 \
     --epochs 50 \
-    --lr 3e-4
+    --lr 3e-4 \
+    --scheduler cosine \
+    --angle_weight 2.0
 
 # 4. 评估模型
 python src/evaluation/rollout_eval.py \
@@ -70,31 +144,58 @@ python src/evaluation/rollout_eval.py \
     --rollout_horizon 15
 ```
 
-**单站点训练（例如只训练Site A）**:
+#### 方案 2: 单站点增强训练（20 维特征）⭐ 推荐
+
 ```bash
-# 1. 预处理单站点
-python preprocess_multisite.py --sites A --output_dir data/processed_siteA
+# 1. 预处理单站点（启用相对特征）
+python src/data/preprocess_multisite.py --sites A --output_dir data/processed_siteA --use_relative_features
 
 # 2. 验证数据
-python validate_preprocessing.py --data_dir data/processed_siteA
+python src/data/validate_preprocessing.py --data_dir data/processed_siteA
 
 # 3. 训练模型
 python src/training/train_world_model.py \
     --train_data data/processed_siteA/train_episodes.npz \
     --val_data data/processed_siteA/val_episodes.npz \
-    --checkpoint_dir checkpoints/world_model_siteA \
-    --input_dim 12 \
-    --continuous_dim 9 \
+    --checkpoint_dir checkpoints/world_model_siteA_enhanced \
+    --input_dim 20 \
+    --continuous_dim 16 \
     --num_sites 1 \
     --num_lanes 19 \
     --batch_size 16 \
-    --epochs 50
+    --epochs 50 \
+    --lr 3e-4 \
+    --scheduler cosine \
+    --lr_min 1e-6 \
+    --weight_decay 1e-5 \
+    --angle_weight 2.0
 
 # 4. 评估模型
 python src/evaluation/rollout_eval.py \
-    --checkpoint checkpoints/world_model_siteA/best_model.pt \
+    --checkpoint checkpoints/world_model_siteA_enhanced/best_model.pt \
     --test_data data/processed_siteA/test_episodes.npz
 ```
+
+### 训练参数说明
+
+**新增参数** (v2.4):
+- `--scheduler`: 学习率调度策略
+  - `cosine`: 余弦退火（推荐）
+  - `step`: 阶梯衰减
+  - `plateau`: 自适应衰减
+  - `none`: 无调度器
+- `--lr_min`: 最低学习率（cosine 模式）
+- `--weight_decay`: L2 正则化系数（推荐 1e-5）
+- `--angle_weight`: Angle 损失权重（推荐 2.0，基础 1.0）
+
+**关键超参数**:
+- `--input_dim`: 输入特征维度（12 或 20）
+- `--continuous_dim`: 连续特征维度（8 或 16）
+- `--latent_dim`: 潜在空间维度（推荐 64-256）
+- `--hidden_dim`: Transformer 隐藏维度（推荐 256-512）
+- `--num_heads`: 注意力头数（推荐 4-8）
+- `--num_layers`: Encoder 层数（推荐 3-4）
+- `--num_dyn_layers`: Dynamics 层数（推荐 2-3）
 
 ---
 
@@ -132,17 +233,20 @@ data/raw/
 ### 步骤2: 运行预处理
 
 **使用的代码文件**:
-- 📄 **主脚本**: `preprocess_multisite.py`
+- 📄 **主脚本**: `src/data/preprocess_multisite.py`
 - 📄 **核心逻辑**: `src/data/preprocess.py`
 - 📄 **数据划分**: `src/data/split_strategy.py`
 
 **命令**:
 ```bash
-# 默认配置（推荐）
-python preprocess_multisite.py
+# 基础配置（12 维特征）
+python src/data/preprocess_multisite.py
+
+# 增强配置（20 维特征）⭐ 推荐
+python src/data/preprocess_multisite.py --use_relative_features
 
 # 自定义参数
-python preprocess_multisite.py \
+python src/data/preprocess_multisite.py \
     --raw_data_dir data/raw \
     --output_dir data/processed \
     --episode_length 80 \
@@ -150,13 +254,14 @@ python preprocess_multisite.py \
     --fps 30.0 \
     --train_ratio 0.7 \
     --val_ratio 0.15 \
-    --test_ratio 0.15
+    --test_ratio 0.15 \
+    --use_relative_features
 ```
 
 **处理流程**:
 
 ```
-preprocess_multisite.py
+src/data/preprocess_multisite.py
   ↓ 调用
 src/data/preprocess.py
   ├─ build_global_timeline()          # 1. 构建每个site的全局时间线
@@ -171,15 +276,22 @@ src/data/preprocess.py
   ├─ encode_lane()                     # 4. 编码lane为site-specific token
   │   └─ "A:A1", "B:crossroads1"等
   │
-  └─ extract_extended_features()       # 5. 提取12维特征
-      ├─ center_x, center_y (标准化)
-      ├─ vx, vy (速度)
-      ├─ ax, ay (加速度)
-      ├─ angle (朝向)
-      ├─ class_id (离散, 不标准化)
-      ├─ lane_id (离散, 不标准化)
-      ├─ has_preceding, has_following
-      └─ site_id (离散, 不标准化)
+  └─ extract_extended_features()       # 5. 提取特征
+      ├─ **基础特征 (12 维)**:
+      │   ├─ center_x, center_y (标准化)
+      │   ├─ vx, vy (速度)
+      │   ├─ ax, ay (加速度)
+      │   ├─ angle (朝向)
+      │   ├─ class_id (离散, 不标准化)
+      │   ├─ lane_id (离散, 不标准化)
+      │   ├─ has_preceding, has_following
+      │   └─ site_id (离散, 不标准化)
+      │
+      └─ **增强特征 (新增 8 维)** 🆕:
+          ├─ preceding_rel_x, preceding_rel_y
+          ├─ preceding_rel_vx, preceding_rel_vy
+          ├─ following_rel_x, following_rel_y
+          └─ following_rel_vx, following_rel_vy
   ↓
 src/data/split_strategy.py
   └─ chronological_split_episodes()    # 6. 时序划分
@@ -189,7 +301,7 @@ src/data/split_strategy.py
 **输出文件**:
 ```
 data/processed/
-├── train_episodes.npz               # [N_train, 80, 50, 12]
+├── train_episodes.npz               # [N_train, 80, 50, F]  F=12或20
 │   ├── 'states'        → [N, T, K, F] 状态矩阵
 │   ├── 'masks'         → [N, T, K] 有效性mask
 │   ├── 'scene_ids'     → [N] site ID
@@ -199,17 +311,18 @@ data/processed/
 ├── val_episodes.npz                 # 同上
 ├── test_episodes.npz                # 同上
 │
-├── metadata.json                    # 元数据
-│   ├── n_features: 12
+├── metadata.json                    # 元数据 🆕 v2.4更新
+│   ├── n_features: 12 或 20
 │   ├── episode_length: 80
 │   ├── context_length: 65
 │   ├── rollout_horizon: 15
 │   ├── fps: 30.0
-│   ├── feature_layout: {...}
+│   ├── feature_layout: {...}       # 特征索引映射
 │   ├── lane_mapping: {...}
-│   └── validation_info: {
+│   └── validation_info: {          # 🆕 关键配置
 │       ├── discrete_features: {7, 8, 11}
-│       └── do_not_normalize: [...]
+│       ├── angle_idx: 6            # 🆕 Angle特征索引
+│       └── do_not_normalize: [7, 8, 11, 6]  # 🆕 包含angle
 │   }
 │
 └── split_config.json                # 划分配置
@@ -223,9 +336,11 @@ data/processed/
 - `C=65`: Context长度 (warm-up, 前65帧)
 - `H=15`: Rollout horizon (预测后15帧)
 - `K=50`: 最大车辆数（padding）
-- `F=12`: 特征维度
+- `F=12 or 20`: 特征维度（基础/增强）
 
 ### 步骤3: 特征说明
+
+#### 基础特征（12 维）
 
 预处理生成**12维输入特征向量** (`src/data/preprocess.py:extract_extended_features()`):
 
@@ -237,65 +352,67 @@ data/processed/
 | 3 | vy | 连续 | ✅ **预测** | Y方向速度 | L389 |
 | 4 | ax | 连续 | ✅ **预测** | X方向加速度 | L390 |
 | 5 | ay | 连续 | ✅ **预测** | Y方向加速度 | L391 |
-| 6 | angle | **周期性** | ✅ **预测+先验** | 🔥 朝向角度（弧度，不归一化，专用损失+物理先验） | L392 |
+| 6 | angle | **周期性** | ✅ **预测** | 🔥 朝向角度（弧度，不归一化） | L392 |
 | 7 | class_id | **离散** | 🔒 **Embedding** | 车辆类别（不标准化，不预测） | L393 |
 | 8 | lane_id | **离散** | 🔒 **Embedding** | 车道ID（不标准化，不预测） | L394 |
-| 9 | has_preceding | 二值 | ✅ **预测** | 是否有前车 | L395 |
-| 10 | has_following | 二值 | ✅ **预测** | 是否有后车 | L396 |
+| 9 | has_preceding | **二值** | ✅ **预测** | 是否有前车（sigmoid输出）| L395 |
+| 10 | has_following | **二值** | ✅ **预测** | 是否有后车（sigmoid输出）| L396 |
 | 11 | site_id | **离散** | 🔒 **Episode-level** | 站点ID 0-8（不标准化，不预测） | L397 |
 
+**连续预测特征**: 8 维 (去除 angle 和 3 个离散特征)
+
+#### 增强特征（20 维）🆕
+
+在基础特征基础上添加：
+
+| 索引 | 特征名 | 类型 | 说明 |
+|------|--------|------|------|
+| 12 | preceding_rel_x | 连续 | 前车相对 x 距离（无前车时=0）|
+| 13 | preceding_rel_y | 连续 | 前车相对 y 距离 |
+| 14 | preceding_rel_vx | 连续 | 前车相对 x 速度 |
+| 15 | preceding_rel_vy | 连续 | 前车相对 y 速度 |
+| 16 | following_rel_x | 连续 | 后车相对 x 距离（无后车时=0）|
+| 17 | following_rel_y | 连续 | 后车相对 y 距离 |
+| 18 | following_rel_vx | 连续 | 后车相对 x 速度 |
+| 19 | following_rel_vy | 连续 | 后车相对 y 速度 |
+
+**连续预测特征**: 16 维
+
+详见：[RELATIVE_FEATURES_GUIDE.md](RELATIVE_FEATURES_GUIDE.md)
+
+#### 特征处理架构
+
 **v2.3 关键架构 (Continuous-Only Decoder)**:
-- ✅ **连续特征 (9维)**: [0,1,2,3,4,5,6,9,10] - Decoder **直接预测**这些特征
+- ✅ **连续特征 (8/16维)**: Decoder **直接预测**
 - 🔒 **离散特征 (3维)**: [7,8,11] - 作为 **Embedding 输入**，episode内保持常量，**不参与预测**
-- 📊 **Loss计算**: 仅在9个连续特征上计算回归loss (Huber)
-- 🎯 **Rollout**: Decoder输出[B,T,K,9]，离散特征从初始状态复制
+- 📊 **Loss计算**: 仅在连续特征上计算回归loss (Huber)
+- 🎯 **Rollout**: Decoder输出[B,T,K,8/16]，离散特征从初始状态复制
 
-**🔥 Angle (朝向角) 特殊处理** (详见 `ANGLE_IMPROVEMENT_GUIDE.md`):
+**🔥 Angle (朝向角) 特殊处理** 🆕 v2.4:
 
-**为什么需要特殊处理**:
-- ❌ **Z-score归一化破坏周期性**: `-π` 和 `π` 是同一方向，但归一化后相差很远
-- ❌ **Huber loss不理解周期性**: 预测 `3.0` vs 真值 `-3.0` 被认为误差 `6.0`，实际只差 `0.28`
-- ✅ **速度方向是强先验**: `angle ≈ atan2(vy, vx)` 是车辆朝向的物理约束
+**问题**:
+- ❌ Z-score归一化破坏周期性: `-π` 和 `π` 是同一方向
+- ✅ **解决方案**: Angle 保持原始弧度值，不做归一化
+- ✅ **元数据配置**: `angle_idx: 6` 添加到 `validation_info`
 
-**架构改进 (方案 C)**:
-1. **预处理层**:
-   - Angle (index 6) 添加到 `do_not_normalize` 列表
-   - 保持原始弧度值 `[-π, π]`，不做 z-score
-   - Metadata 记录: `validation_info.angle_idx: 6`
+详见：[ANGLE_IMPROVEMENT_GUIDE.md](ANGLE_IMPROVEMENT_GUIDE.md)
 
-2. **Decoder层** (`src/models/decoder.py`):
-   - 新增 `enable_angle_head=True` 参数
-   - 专用 `angle_head: Linear(hidden, max_agents)` 输出原始弧度
-   - `forward()` 返回: `(states, existence_logits, residual_xy, angle)`
+**🔥 二值特征处理** 🆕 v2.4:
 
-3. **WorldModel层** (`src/models/world_model.py`):
-   - 新增 `idx_angle=6` 参数
-   - 新方法 `_kinematic_prior_angle()`: 基于速度计算 angle 先验
-     ```python
-     angle_prior = torch.atan2(vy, vx)  # 速度方向即朝向
-     ```
-   - 混合先验与预测: `pred_angle = 0.7 * prior + 0.3 * decoder_out`
-   - `forward()` 返回: `reconstructed_angle`, `predicted_angle` 单独字段
+- ✅ **has_preceding/has_following** 使用 Sigmoid 激活
+- ✅ **Decoder**: `binary_feature_indices=[6,7]` (在连续特征输出中的索引)
+- ✅ **更准确的二值预测**
 
-4. **Loss函数层** (`src/training/losses.py`):
-   - 新增 `angle_weight=0.5` 参数
-   - 新方法 `_angular_distance()`: 使用 `atan2(sin(diff), cos(diff))` 计算周期性距离
-   - 新方法 `_angular_loss()`: 对 angle 使用 angular distance loss
-   - 总损失: `total_loss += angle_weight * (recon_angle_loss + pred_angle_loss)`
-
-**效果**:
-- 🎯 Heading error: 从 30-50° 降至 5-10°
-- ⚡ 训练更稳定: angular distance 避免梯度爆炸
-- 🔄 收敛更快: 物理先验提供强引导
+详见: [src/models/decoder.py](src/models/decoder.py)
 
 ### 步骤4: 验证预处理结果
 
 **使用的代码文件**:
-- 📄 **验证脚本**: `validate_preprocessing.py`
+- 📄 **验证脚本**: `src/data/validate_preprocessing.py`
 
 **命令**:
 ```bash
-python validate_preprocessing.py
+python src/data/validate_preprocessing.py
 ```
 
 **检查项**:
@@ -304,21 +421,24 @@ python validate_preprocessing.py
 ✅ 1. 元数据一致性 (fps=30, T=80, C=65, H=15)
 ✅ 2. Lane token格式 ("site:lane")
 ✅ 3. Train/Val/Test时序无重叠
-✅ 4. 离散特征未被标准化
-✅ 5. 特征维度正确 (F=12)
-✅ 6. Episode数量合理
+✅ 4. 离散特征未被标准化 🆕 v2.4
+✅ 5. Angle索引配置正确 🆕 v2.4
+✅ 6. 特征维度正确 (F=12或20)
+✅ 7. Episode数量合理
 ```
 
 **期望输出**:
 ```
 ✅ All preprocessing checks passed!
 - Metadata: fps=30.0, T=80, C=65, H=15
-- Features: 12 (9 continuous, 3 discrete)
+- Features: 12/20 (8/16 continuous, 3 discrete, 1 angle)
 - Lane tokens: site:lane format OK
 - Splits: No temporal overlap
 - Train: 44100 episodes
 - Val: 6300 episodes
 - Test: 6300 episodes
+- Angle index: 6 ✅
+- Binary features: [9, 10] ✅
 ```
 
 ---
@@ -363,7 +483,7 @@ python src/training/train_world_model.py \
 **单站点训练（例如只训练Site A）**:
 ```bash
 # 1. 预处理单站点数据
-python preprocess_multisite.py \
+python src/data/preprocess_multisite.py \
     --raw_data_dir data/raw \
     --output_dir data/processed_siteA \
     --sites A \
@@ -411,7 +531,7 @@ python src/training/train_world_model.py \
 **单站点训练示例（其他站点）**:
 ```bash
 # Site B
-python preprocess_multisite.py --sites B --output_dir data/processed_siteB
+python src/data/preprocess_multisite.py --sites B --output_dir data/processed_siteB
 python src/training/train_world_model.py \
     --train_data data/processed_siteB/train_episodes.npz \
     --val_data data/processed_siteB/val_episodes.npz \
@@ -419,7 +539,7 @@ python src/training/train_world_model.py \
     --num_sites 1 --num_lanes 25
 
 # Site C
-python preprocess_multisite.py --sites C --output_dir data/processed_siteC
+python src/data/preprocess_multisite.py --sites C --output_dir data/processed_siteC
 python src/training/train_world_model.py \
     --train_data data/processed_siteC/train_episodes.npz \
     --val_data data/processed_siteC/val_episodes.npz \
@@ -430,7 +550,7 @@ python src/training/train_world_model.py \
 **多站点组合训练示例**:
 ```bash
 # 训练Site A + B + C的组合
-python preprocess_multisite.py --sites A B C --output_dir data/processed_ABC
+python src/data/preprocess_multisite.py --sites A B C --output_dir data/processed_ABC
 python src/training/train_world_model.py \
     --train_data data/processed_ABC/train_episodes.npz \
     --val_data data/processed_ABC/val_episodes.npz \
@@ -1315,8 +1435,10 @@ traffic_wm/
 ├── 📄 WORLD_MODEL_COMPARISON.md        # 与DreamerV3的架构对比
 ├── 📄 requirements.txt                 # Python依赖
 │
-├── 📄 preprocess_multisite.py          # ⭐ 预处理主脚本
-├── 📄 validate_preprocessing.py        # ⭐ 验证脚本
+├── � tests/                           # 测试文件 🆕
+│   ├── 📄 test_fixes.py                # 修复验证测试
+│   ├── 📄 test_relative_features.py    # 相对特征测试
+│   └── 📄 test_continuity.py           # 连续性测试
 │
 ├── 📂 data/
 │   ├── raw/                            # 原始CSV数据 (用户提供)
@@ -1324,7 +1446,7 @@ traffic_wm/
 │   │   ├── B/drone_1.csv, ...
 │   │   └── I/...
 │   └── processed/                      # 预处理输出
-│       ├── train_episodes.npz          # [N, 80, 50, 12]
+│       ├── train_episodes.npz          # [N, 80, 50, 12/20]
 │       ├── val_episodes.npz
 │       ├── test_episodes.npz
 │       ├── metadata.json               # 元数据配置
@@ -1333,6 +1455,9 @@ traffic_wm/
 ├── 📂 src/
 │   ├── 📂 data/
 │   │   ├── 📄 __init__.py
+│   │   ├── 📄 preprocess_multisite.py  # ⭐ 预处理主脚本 🆕
+│   │   ├── 📄 validate_preprocessing.py # ⭐ 验证脚本 🆕
+│   │   ├── 📄 reprocess_with_relative_features.py # 重新预处理脚本 🆕
 │   │   ├── 📄 preprocess.py            # 预处理核心逻辑
 │   │   │   ├─ build_global_timeline()
 │   │   │   ├─ detect_gaps_and_split_segments()
@@ -1353,6 +1478,7 @@ traffic_wm/
 │   │   ├── 📄 decoder.py               # ⭐ StateDecoder
 │   │   │   ├─ MLP Layers
 │   │   │   ├─ State Head ([K, F])
+│   │   │   ├─ Binary Features Sigmoid 🆕
 │   │   │   └─ Existence Head ([K])
 │   │   ├── 📄 dynamics.py              # ⭐ LatentDynamics
 │   │   │   ├─ GRUDynamics
@@ -1360,12 +1486,13 @@ traffic_wm/
 │   │   │   └─ TransformerDynamics
 │   │   └── 📄 world_model.py           # ⭐ WorldModel
 │   │       ├─ forward()
-│   │       └─ rollout()  ← 修复后的实现
+│   │       └─ rollout()
 │   │
 │   ├── 📂 training/
 │   │   ├── 📄 __init__.py
 │   │   ├── 📄 train_world_model.py     # ⭐ 训练主脚本
 │   │   │   ├─ Trainer class
+│   │   │   ├─ LR Scheduler 🆕
 │   │   │   ├─ train_epoch()
 │   │   │   ├─ validate()
 │   │   │   └─ save_checkpoint()
@@ -1674,27 +1801,33 @@ python src/training/train_world_model.py \
 | ... | ... | 预处理后查看metadata确认 |
 | **多站点** | ~150 | 所有站点车道union |
 
----
-
 ## 🐛 故障排查
 
-### 问题1: Loss不下降
+### 问题1: Loss不下降 / 收敛缓慢 🆕
 
-**症状**: Train loss在高值plateau,不下降
+**症状**: Train loss在高值plateau,不下降或下降缓慢
 
-**可能原因**:
+**可能原因** 🆕 v2.4:
 1. Learning rate过高或过低
 2. 离散特征被错误标准化
-3. Input_dim不匹配
-4. Batch size太小
+3. **Angle特征未正确配置** - 检查 metadata.json 中是否有 `angle_idx: 6`
+4. Input_dim/continuous_dim不匹配
+5. Batch size太小
+6. 没有使用学习率调度器
 
 **解决方案**:
 ```bash
-# 1. 检查元数据
-cat data/processed/metadata.json | grep -E "n_features|discrete_features"
+# 1. 检查元数据（关键！）
+cat data/processed/metadata.json | grep -E "n_features|discrete_features|angle_idx"
+# 应该看到: "angle_idx": 6
 
-# 2. 降低学习率
-python src/training/train_world_model.py --learning_rate 1e-4
+# 2. 使用推荐训练参数 🆕
+python src/training/train_world_model.py \
+    --learning_rate 1e-3 \
+    --scheduler cosine \       # 🆕 使用余弦退火
+    --lr_min 1e-6 \
+    --weight_decay 1e-5 \      # 🆕 添加正则化
+    --angle_weight 2.0         # 🆕 增加angle损失权重
 
 # 3. 增加batch size
 python src/training/train_world_model.py --batch_size 64
@@ -1720,15 +1853,63 @@ tail -f logs/trainer.log
 # 1. 降低学习率
 python src/training/train_world_model.py --learning_rate 5e-4
 
-# 2. 添加gradient clipping (需修改代码)
-# 在train_world_model.py中添加:
-torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+# 2. 使用gradient clipping 🆕
+python src/training/train_world_model.py --grad_clip 1.0
 
 # 3. 检查数据
-python validate_preprocessing.py  # 确保数据正常
+python src/data/validate_preprocessing.py  # 确保数据正常
 ```
 
-### 问题3: 预测不连续
+### 问题3: 验证集Loss过早停滞（过拟合）
+
+**症状**: 
+- Train loss 持续下降 (1.78 → 1.35)
+- Val loss 在某个值停滞或波动 (1.60 → 1.38 → 停滞)
+
+**解决方案**:
+```bash
+# 方案 A: 增加正则化（推荐）
+python src/training/train_world_model.py \
+    --weight_decay 0.001 \
+    --scheduler plateau     # 验证集loss不下降时降低学习率
+
+# 方案 B: 使用更多数据
+python src/data/preprocess_multisite.py --sites A B C  # 多站点训练
+
+# 方案 C: Early stopping
+# 在 train_world_model.py 中添加 patience 参数
+```
+
+### 问题4: Angle预测误差大 🆕
+
+**症状**: Heading MAE > 0.5 rad (约30度)
+
+**根本原因**:
+1. **Angle被错误归一化** - angle是周期性特征，z-score会破坏周期性
+2. **metadata.json缺少angle_idx配置**
+3. **angle_weight过小** - 默认权重不足以让模型重视angle
+
+**完整解决方案**:
+```bash
+# 1. 检查并修复 metadata.json
+cat data/processed/metadata.json | grep angle_idx
+# 如果没有，添加:
+# "validation_info": {
+#     "angle_idx": 6,
+#     "do_not_normalize": [6, 7, 8, 11]
+# }
+
+# 2. 使用更大的 angle_weight
+python src/training/train_world_model.py --angle_weight 2.0
+
+# 3. 如果已经训练了错误的数据，需要重新预处理
+python src/data/preprocess_multisite.py --sites A
+```
+
+**预期效果**:
+- Angle MAE: 从 0.84 rad (48°) 降至 0.09-0.17 rad (5-10°)
+
+### 问题5: 预测不连续
 
 **症状**: 可视化结果中,context和prediction之间有跳跃
 
@@ -1737,27 +1918,96 @@ python validate_preprocessing.py  # 确保数据正常
 2. 调整loss权重(增大pred_weight)
 3. 检查normalization stats是否正确加载
 
-### 问题4: Collision Rate异常
-
-**症状**: Collision rate = 100%
-
-**原因**: safety_margin设置过大
-
-**解决方案**:
-```python
-# 修改src/evaluation/prediction_metrics.py:166
-compute_collision_rate(predicted, masks, safety_margin=4.0)
-# 调整为合理的车辆宽度(3-5米)
-```
-
-### 问题5: 模型加载失败
+### 问题6: 模型加载失败
 
 **症状**: RuntimeError: size mismatch
 
 **解决方案**:
 1. 确保checkpoint与当前代码版本匹配
 2. 检查metadata.json中的配置是否正确
-3. 确认input_dim, latent_dim等参数与训练时一致
+3. 确认input_dim, continuous_dim等参数与训练时一致
+4. 如果从12维升级到20维，需要重新训练
+
+### 问题7: 相对特征数据不可用
+
+**症状**: 加载数据时显示特征维度=12，但想使用20维
+
+**解决方案**:
+```bash
+# 重新预处理数据，启用相对特征
+python src/data/reprocess_with_relative_features.py --site A
+
+# 或者从头开始
+python src/data/preprocess_multisite.py --sites A --use_relative_features
+```
+
+### 问题8: 二值特征预测精度低
+
+**症状**: has_preceding/has_following MAE > 0.6
+
+**原因**: 二值特征难以预测（依赖周围车辆）
+
+**解决方案**:
+```bash
+# v2.4 已添加 sigmoid 激活，如果还是不行：
+# 1. 接受当前精度（不影响核心预测）
+# 2. 或增加这些特征的loss权重（需修改代码）
+```
+
+---
+
+## 📚 参考资料
+
+### 核心概念
+
+**World Model 是什么？**
+
+World Model 是一个学习环境动态的神经网络，可以：
+- 从观测序列中学习潜在表示
+- 预测未来状态
+- 用于轨迹预测、规划和仿真
+
+**与 DreamerV3 的区别**:
+- **DreamerV3**: 适用于强化学习，使用 RSSM (循环状态空间模型)，带有随机性
+- **本项目**: 适用于轨迹预测，确定性模型，专注于多智能体交通场景
+
+**关键特性**:
+1. **Multi-agent encoder**: 使用 Transformer 处理多车辆交互
+2. **Deterministic dynamics**: GRU/LSTM/Transformer 建模时序
+3. **Physics-aware decoder**: 集成运动学先验
+4. **Site/Lane conditioning**: 支持多场景泛化
+
+### 架构设计原则
+
+1. **Encoder**: 提取场景级潜在表示
+   - 输入: [B, T, K, F] 多车辆状态
+   - 输出: [B, T, latent_dim] 场景潜在向量
+
+2. **Dynamics**: 建模时序演化
+   - 1-step transition: z[t] → z[t+1]
+   - 支持 GRU/LSTM/Transformer
+
+3. **Decoder**: 重建车辆状态
+   - 输入: [B, T, latent_dim]
+   - 输出: [B, T, K, F_continuous] + masks
+
+---
+
+## 📚 文档索引
+
+### 核心文档
+- 📘 [README.md](README.md) - 本文档（完整使用指南）
+---
+
+## 📚 文档说明
+
+本项目包含以下文档：
+
+- **README.md** (本文档) - 完整的用户指南和参考手册
+- **DATA_GUIDE.md** - 数据格式、预处理流程详解  
+- **CODE_DOCUMENTATION.md** - 代码结构和API文档
+
+所有功能说明、故障排查、最佳实践都已整合到本 README 中。
 
 ---
 
@@ -1779,31 +2029,40 @@ MIT License
 
 ---
 
-## 📮 联系与文档
+## 📮 版本信息
 
-**详细文档**:
-- 📘 `CLAUDE.md` - 详细开发指南 (中文)
-- 📘 `WORLD_MODEL_COMPARISON.md` - 与DreamerV3架构对比
-- 📘 `DEBUG_REPORT.md` - Debug报告
-- 📘 `COMPLETE_DEBUG_SUMMARY_CN.md` - 完整debug总结
+**项目版本**: v2.4 🆕 ✅
 
-**快速查找**:
-- 如何修改特征? → `src/data/preprocess.py:extract_extended_features`
-- 如何修改模型架构? → `src/models/encoder.py`, `decoder.py`, `dynamics.py`
-- 如何修改loss? → `src/training/losses.py`
-- 如何添加新指标? → `src/evaluation/prediction_metrics.py`
+**更新日志**:
+- **v2.4** (2024):
+  - ✅ 添加相对位置特征（8维）
+  - ✅ Learning Rate Scheduler (cosine/step/plateau)
+  - ✅ Angle优化（修复归一化，添加angle_idx）
+  - ✅ 二值特征Sigmoid激活
+  - ✅ 完善metadata.json配置
+  - ✅ 重组项目结构（脚本移至src/data，测试移至tests）
+
+- **v2.3**:
+  - ✅ Decoder只输出连续特征
+  - ✅ 离散特征作为episode-level常量
+
+- **v2.2**:
+  - ✅ 多站点支持
+  - ✅ 时序划分策略
+
+**核心特性**:
+- Transformer编码器 + 时序动力学 + 物理先验
+- Decoder输出8/16个连续特征（离散特征作为常量）
+- Angle专用处理（不归一化）
+- 可选的相对位置特征（车辆交互建模）
 
 ---
 
-**项目版本**: 1.2 ✅
-**核心特性**:
-- Transformer编码器 + 时序动力学 + 物理先验
-- Decoder输出9个连续特征（离散特征作为常量）
-- Angle专用处理（不归一化 + 物理先验 + 周期性损失）
-- 运动学方程物理先验 + 学习残差
-
-**相关文档**:
-- 📘 `ANGLE_IMPROVEMENT_GUIDE.md` - Angle改进详细指南
-- 📘 `CODE_DOCUMENTATION.md` - 代码级函数文档
-- 📘 `WORLD_MODEL_COMPARISON.md` - 与DreamerV3对比
+**快速查找**:
+- 如何修改特征? → [src/data/preprocess.py](src/data/preprocess.py):`extract_extended_features`
+- 如何修改模型架构? → [src/models/](src/models/) (encoder.py, decoder.py, dynamics.py)
+- 如何修改loss? → [src/training/losses.py](src/training/losses.py)
+- 如何添加新指标? → [src/evaluation/prediction_metrics.py](src/evaluation/prediction_metrics.py)
+- 数据格式详解? → [DATA_GUIDE.md](DATA_GUIDE.md)
+- API文档? → [CODE_DOCUMENTATION.md](CODE_DOCUMENTATION.md)
 
