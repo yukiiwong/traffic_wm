@@ -175,3 +175,9 @@ data/processed/
 logs/
 runs/
 wandb/
+data/processed_siteA/
+*.npz
+*.pth
+*.pt
+*.ckpt
+*.h5
