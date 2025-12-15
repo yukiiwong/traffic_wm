@@ -1,257 +1,242 @@
 """
-Prediction Metrics for Multi-Agent Trajectory Evaluation
+Prediction Metrics for Multi-Agent Trajectory Evaluation.
 
-Includes ADE, FDE, collision rate, and other metrics.
+This module is used by src.evaluation.rollout_eval and provides:
+- ADE / FDE (position errors)
+- velocity error
+- heading error (wrap-around safe, radians -> degrees)
+- collision metrics (robust to padding leakage; supports pair/frame/episode)
+
+Assumptions (match your metadata / feature layout):
+- position: indices (0,1) -> (x,y)
+- velocity: indices (2,3) -> (vx,vy) if present
+- acceleration: indices (4,5) -> (ax,ay) if present
+- heading/angle: index is configurable (for your SiteA layout it's feature 6: "angle")
 """
 
+from __future__ import annotations
+
+from typing import Dict, Optional, Literal
+import math
+
 import torch
-import numpy as np
-from typing import Dict, Tuple, Optional
-import sys
-from pathlib import Path
 
-# Add parent directory to path for imports
-sys.path.append(str(Path(__file__).parent.parent))
-from utils.common import convert_pixels_to_meters, get_pixel_to_meter_conversion
+# IMPORTANT: Use absolute imports so `python -m src.evaluation.rollout_eval` works reliably.
+from src.utils.common import convert_pixels_to_meters, get_pixel_to_meter_conversion
 
 
-def compute_ade(
-    predicted: torch.Tensor,
-    ground_truth: torch.Tensor,
-    masks: torch.Tensor
-) -> float:
+def compute_ade(predicted: torch.Tensor, ground_truth: torch.Tensor, masks: torch.Tensor) -> float:
     """
-    Average Displacement Error (ADE).
-
-    Average L2 distance between predicted and ground truth positions
-    across all time steps and agents.
+    Average Displacement Error (ADE): mean L2 distance over all valid (t,k).
 
     Args:
-        predicted: [B, T, K, F] predicted states (F >= 2 for x, y)
-        ground_truth: [B, T, K, F] ground truth states
-        masks: [B, T, K] binary mask for valid agents
+        predicted: [B, T, K, F] (F >= 2)
+        ground_truth: [B, T, K, F]
+        masks: [B, T, K] (0/1)
 
     Returns:
-        ADE value (meters)
+        ADE (same unit as x,y; meters if you converted before calling)
     """
-    # Extract positions (x, y)
-    pred_pos = predicted[..., :2]  # [B, T, K, 2]
-    gt_pos = ground_truth[..., :2]  # [B, T, K, 2]
-
-    # Compute L2 distance
-    displacement = torch.norm(pred_pos - gt_pos, dim=-1)  # [B, T, K]
-
-    # Apply mask
-    masked_displacement = displacement * masks
-
-    # Average over valid elements
-    ade = masked_displacement.sum() / masks.sum().clamp(min=1)
-
-    return ade.item()
+    pred_pos = predicted[..., :2]
+    gt_pos = ground_truth[..., :2]
+    displacement = torch.norm(pred_pos - gt_pos, dim=-1)  # [B,T,K]
+    masked = displacement * masks
+    return (masked.sum() / masks.sum().clamp(min=1)).item()
 
 
-def compute_fde(
-    predicted: torch.Tensor,
-    ground_truth: torch.Tensor,
-    masks: torch.Tensor
-) -> float:
+def compute_fde(predicted: torch.Tensor, ground_truth: torch.Tensor, masks: torch.Tensor) -> float:
     """
-    Final Displacement Error (FDE).
-
-    L2 distance between predicted and ground truth positions
-    at the final time step.
-
-    Args:
-        predicted: [B, T, K, F] predicted states
-        ground_truth: [B, T, K, F] ground truth states
-        masks: [B, T, K] binary mask
+    Final Displacement Error (FDE): L2 distance at final time step.
 
     Returns:
-        FDE value (meters)
+        FDE (same unit as x,y)
     """
-    # Extract final positions
-    pred_final = predicted[:, -1, :, :2]  # [B, K, 2]
-    gt_final = ground_truth[:, -1, :, :2]  # [B, K, 2]
-    mask_final = masks[:, -1, :]  # [B, K]
-
-    # Compute L2 distance
-    displacement = torch.norm(pred_final - gt_final, dim=-1)  # [B, K]
-
-    # Apply mask
-    masked_displacement = displacement * mask_final
-
-    # Average
-    fde = masked_displacement.sum() / mask_final.sum().clamp(min=1)
-
-    return fde.item()
+    pred_final = predicted[:, -1, :, :2]
+    gt_final = ground_truth[:, -1, :, :2]
+    mask_final = masks[:, -1, :]
+    displacement = torch.norm(pred_final - gt_final, dim=-1)
+    masked = displacement * mask_final
+    return (masked.sum() / mask_final.sum().clamp(min=1)).item()
 
 
-def compute_velocity_error(
-    predicted: torch.Tensor,
-    ground_truth: torch.Tensor,
-    masks: torch.Tensor
-) -> float:
+def compute_velocity_error(predicted: torch.Tensor, ground_truth: torch.Tensor, masks: torch.Tensor) -> float:
     """
-    Average velocity error.
-
-    Args:
-        predicted: [B, T, K, F] predicted states (F >= 4 for vx, vy)
-        ground_truth: [B, T, K, F] ground truth states
-        masks: [B, T, K] binary mask
+    Mean L2 velocity error over all valid (t,k).
 
     Returns:
-        Average velocity error (m/s)
+        velocity error (same unit as vx,vy; m/s if converted before calling)
     """
-    if predicted.shape[-1] < 4:
+    if predicted.shape[-1] < 4 or ground_truth.shape[-1] < 4:
         return 0.0
+    pred_vel = predicted[..., 2:4]
+    gt_vel = ground_truth[..., 2:4]
+    vel_error = torch.norm(pred_vel - gt_vel, dim=-1)  # [B,T,K]
+    masked = vel_error * masks
+    return (masked.sum() / masks.sum().clamp(min=1)).item()
 
-    # Extract velocities (vx, vy)
-    pred_vel = predicted[..., 2:4]  # [B, T, K, 2]
-    gt_vel = ground_truth[..., 2:4]  # [B, T, K, 2]
 
-    # Compute L2 error
-    vel_error = torch.norm(pred_vel - gt_vel, dim=-1)  # [B, T, K]
+def _angular_diff_rad(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """
+    Smallest angular difference |a-b| on a circle, assuming radians.
 
-    # Apply mask
-    masked_error = vel_error * masks
-
-    # Average
-    avg_error = masked_error.sum() / masks.sum().clamp(min=1)
-
-    return avg_error.item()
+    Output in [0, pi].
+    """
+    # Using atan2(sin, cos) is numerically stable.
+    return torch.abs(torch.atan2(torch.sin(a - b), torch.cos(a - b)))
 
 
 def compute_heading_error(
     predicted: torch.Tensor,
     ground_truth: torch.Tensor,
     masks: torch.Tensor,
-    heading_idx: int = 4
+    heading_idx: int,
+    assume_radians: bool = True,
 ) -> float:
     """
-    Average heading error (in degrees).
+    Average heading error.
 
     Args:
-        predicted: [B, T, K, F] predicted states
-        ground_truth: [B, T, K, F] ground truth states
-        masks: [B, T, K] binary mask
-        heading_idx: Index of heading in feature dimension
+        heading_idx: which feature dimension corresponds to heading/angle.
+                    (For your metadata: angle is feature 6.)
+        assume_radians: if True, converts result to degrees for readability.
 
     Returns:
-        Average heading error (degrees)
+        mean heading error in degrees (default) or radians (if assume_radians=False)
     """
-    if predicted.shape[-1] <= heading_idx:
+    if predicted.shape[-1] <= heading_idx or ground_truth.shape[-1] <= heading_idx:
         return 0.0
 
-    # Extract headings
-    pred_heading = predicted[..., heading_idx]  # [B, T, K]
-    gt_heading = ground_truth[..., heading_idx]  # [B, T, K]
+    pred_h = predicted[..., heading_idx]
+    gt_h = ground_truth[..., heading_idx]
 
-    # Compute angular difference (handling wrap-around)
-    diff = torch.abs(pred_heading - gt_heading)
-    diff = torch.min(diff, 2 * np.pi - diff)  # Wrap to [0, pi]
+    diff = _angular_diff_rad(pred_h, gt_h)  # [B,T,K] in radians
+    masked = diff * masks
+    avg = (masked.sum() / masks.sum().clamp(min=1))
 
-    # Apply mask
-    masked_diff = diff * masks
+    if assume_radians:
+        return (avg * (180.0 / math.pi)).item()
+    return avg.item()
 
-    # Average and convert to degrees
-    avg_error = masked_diff.sum() / masks.sum().clamp(min=1)
-    avg_error_deg = avg_error * (180.0 / np.pi)
 
-    return avg_error_deg.item()
+CollisionMode = Literal["pair", "frame", "episode"]
 
 
 def compute_collision_rate(
     predicted: torch.Tensor,
     masks: torch.Tensor,
-    safety_margin: float = 2.0
+    safety_margin: float = 2.0,
+    mode: CollisionMode = "frame",
+    zero_pos_eps: float = 1e-3,
 ) -> float:
     """
-    Estimate collision rate based on inter-vehicle distances.
+    Robust collision metric based on inter-agent distances on each frame.
+
+    Why "robust":
+    - filters near-zero positions (often padding leakage where x=y=0) even if mask==1
+    - supports different reporting modes:
+        * "pair": percentage of colliding pairs among all valid pairs (can be overly sensitive when K is large)
+        * "frame": percentage of evaluated frames (b,t) where ANY collision occurs (recommended)
+        * "episode": percentage of episodes b where ANY collision occurs over the horizon
 
     Args:
-        predicted: [B, T, K, F] predicted states
-        masks: [B, T, K] binary mask
-        safety_margin: Minimum safe distance (meters)
+        predicted: [B,T,K,F] (expects x,y in [:2])
+        masks: [B,T,K]
+        safety_margin: collision distance threshold in the same unit as x,y (meters if converted)
+        mode: "pair" | "frame" | "episode"
+        zero_pos_eps: filter points with ||(x,y)|| <= eps (padding leakage)
 
     Returns:
-        Collision rate (percentage)
+        collision rate in percentage (%)
     """
-    B, T, K, F = predicted.shape
+    B, T, K, _ = predicted.shape
+    pos = predicted[..., :2]  # [B,T,K,2]
 
-    # Extract positions
-    positions = predicted[..., :2]  # [B, T, K, 2]
+    if mode == "pair":
+        total_pairs = 0
+        total_collisions = 0
 
-    total_checks = 0
-    total_collisions = 0
+        for b in range(B):
+            for t in range(T):
+                valid = masks[b, t].bool()
+                p = pos[b, t, valid]
+                # filter near-zero positions
+                keep = (p.norm(dim=-1) > zero_pos_eps)
+                p = p[keep]
+                n = p.shape[0]
+                if n < 2:
+                    continue
+                d = torch.cdist(p, p)  # [n,n]
+                tri = torch.triu(torch.ones_like(d, dtype=torch.bool), diagonal=1)
+                rel = d[tri]
+                total_collisions += (rel < safety_margin).sum().item()
+                total_pairs += rel.numel()
+
+        return 0.0 if total_pairs == 0 else (total_collisions / total_pairs) * 100.0
+
+    # frame / episode
+    frames_evaluated = 0
+    frames_with_collision = 0
+    episodes_with_collision = 0
 
     for b in range(B):
+        episode_has_collision = False
         for t in range(T):
-            # Get valid agents at this timestep
-            valid_mask = masks[b, t].bool()  # [K]
-            valid_positions = positions[b, t, valid_mask]  # [n_valid, 2]
-
-            n_valid = valid_positions.shape[0]
-            if n_valid < 2:
+            valid = masks[b, t].bool()
+            p = pos[b, t, valid]
+            keep = (p.norm(dim=-1) > zero_pos_eps)
+            p = p[keep]
+            n = p.shape[0]
+            if n < 2:
                 continue
 
-            # Compute pairwise distances
-            pos_expanded_1 = valid_positions.unsqueeze(1)  # [n_valid, 1, 2]
-            pos_expanded_2 = valid_positions.unsqueeze(0)  # [1, n_valid, 2]
+            d = torch.cdist(p, p)
+            tri = torch.triu(torch.ones_like(d, dtype=torch.bool), diagonal=1)
+            rel = d[tri]
 
-            distances = torch.norm(pos_expanded_1 - pos_expanded_2, dim=-1)  # [n_valid, n_valid]
+            any_col = bool((rel < safety_margin).any().item())
+            frames_evaluated += 1
+            if any_col:
+                frames_with_collision += 1
+                episode_has_collision = True
 
-            # Count collisions (distance < safety_margin)
-            # Exclude self-comparisons (diagonal)
-            mask_upper_tri = torch.triu(torch.ones_like(distances), diagonal=1).bool()
-            relevant_distances = distances[mask_upper_tri]
+        if episode_has_collision:
+            episodes_with_collision += 1
 
-            collisions = (relevant_distances < safety_margin).sum().item()
-
-            total_collisions += collisions
-            total_checks += len(relevant_distances)
-
-    if total_checks == 0:
-        return 0.0
-
-    collision_rate = (total_collisions / total_checks) * 100.0
-    return collision_rate
+    if mode == "frame":
+        return 0.0 if frames_evaluated == 0 else (frames_with_collision / frames_evaluated) * 100.0
+    if mode == "episode":
+        return (episodes_with_collision / B) * 100.0
+    raise ValueError(f"Unknown collision mode: {mode}")
 
 
 def compute_existence_metrics(
     predicted_existence: torch.Tensor,
-    ground_truth_masks: torch.Tensor
+    ground_truth_masks: torch.Tensor,
 ) -> Dict[str, float]:
     """
-    Compute precision, recall, F1 for agent existence prediction.
+    Precision / Recall / F1 for existence prediction.
 
     Args:
-        predicted_existence: [B, T, K] existence logits or probabilities
-        ground_truth_masks: [B, T, K] binary masks
+        predicted_existence: [B,T,K] logits or probs
+        ground_truth_masks: [B,T,K] (0/1)
 
     Returns:
-        Dictionary with precision, recall, F1
+        dict: precision, recall, f1
     """
-    # Convert to binary predictions
-    if predicted_existence.min() < 0:  # Logits
-        pred_binary = (torch.sigmoid(predicted_existence) > 0.5).float()
-    else:  # Probabilities
-        pred_binary = (predicted_existence > 0.5).float()
+    if predicted_existence.min().item() < 0:  # logits
+        pred_bin = (torch.sigmoid(predicted_existence) > 0.5).float()
+    else:
+        pred_bin = (predicted_existence > 0.5).float()
 
-    # True positives, false positives, false negatives
-    tp = (pred_binary * ground_truth_masks).sum().item()
-    fp = (pred_binary * (1 - ground_truth_masks)).sum().item()
-    fn = ((1 - pred_binary) * ground_truth_masks).sum().item()
+    tp = (pred_bin * ground_truth_masks).sum().item()
+    fp = (pred_bin * (1 - ground_truth_masks)).sum().item()
+    fn = ((1 - pred_bin) * ground_truth_masks).sum().item()
 
-    # Precision, recall, F1
     precision = tp / (tp + fp + 1e-8)
     recall = tp / (tp + fn + 1e-8)
     f1 = 2 * precision * recall / (precision + recall + 1e-8)
 
-    return {
-        'precision': precision,
-        'recall': recall,
-        'f1': f1
-    }
+    return {"precision": precision, "recall": recall, "f1": f1}
 
 
 def compute_all_metrics(
@@ -260,75 +245,84 @@ def compute_all_metrics(
     masks: torch.Tensor,
     predicted_existence: Optional[torch.Tensor] = None,
     pixel_to_meter: Optional[float] = None,
-    convert_to_meters: bool = False
+    convert_to_meters: bool = False,
+    heading_idx: Optional[int] = None,
+    # collision configs
+    collision_mode: CollisionMode = "frame",
+    safety_margin: float = 2.0,
+    zero_pos_eps: float = 1e-3,
 ) -> Dict[str, float]:
     """
     Compute all evaluation metrics.
 
-    Args:
-        predicted: [B, T, K, F] predicted states
-        ground_truth: [B, T, K, F] ground truth states
-        masks: [B, T, K] binary masks
-        predicted_existence: [B, T, K] optional existence predictions
-        pixel_to_meter: Conversion factor from pixels to meters.
-                       If None and convert_to_meters=True, will auto-load.
-        convert_to_meters: If True, convert coordinates from pixels to meters
-                          before computing metrics
+    Notes for your project:
+    - your world_model.rollout returns CONTINUOUS features only, with layout matching continuous_indices.
+    - for SiteA layout: angle is feature 6 -> if predicted/gt include angle at index 6, pass heading_idx=6.
+      If predicted/gt are continuous-only, pass heading_idx = continuous_indices.index(6).
 
-    Returns:
-        Dictionary of all metrics (in meters if convert_to_meters=True)
+    Args:
+        convert_to_meters:
+            If True, converts x,y (and vx,vy / ax,ay if present) from pixels to meters.
+            If your predicted/gt are already in meters, set False.
     """
-    # Apply coordinate conversion if requested
     if convert_to_meters:
         if pixel_to_meter is None:
             pixel_to_meter = get_pixel_to_meter_conversion()
-            print(f"Auto-loaded pixel_to_meter conversion factor: {pixel_to_meter:.6f}")
 
-        # Convert both predicted and ground truth to meters
         predicted = convert_pixels_to_meters(
             predicted,
             pixel_to_meter,
             position_indices=(0, 1),
             velocity_indices=(2, 3) if predicted.shape[-1] > 3 else None,
-            acceleration_indices=(4, 5) if predicted.shape[-1] > 5 else None
+            acceleration_indices=(4, 5) if predicted.shape[-1] > 5 else None,
         )
         ground_truth = convert_pixels_to_meters(
             ground_truth,
             pixel_to_meter,
             position_indices=(0, 1),
             velocity_indices=(2, 3) if ground_truth.shape[-1] > 3 else None,
-            acceleration_indices=(4, 5) if ground_truth.shape[-1] > 5 else None
+            acceleration_indices=(4, 5) if ground_truth.shape[-1] > 5 else None,
         )
 
-    metrics = {
-        'ade': compute_ade(predicted, ground_truth, masks),
-        'fde': compute_fde(predicted, ground_truth, masks),
-        'velocity_error': compute_velocity_error(predicted, ground_truth, masks),
-        'heading_error': compute_heading_error(predicted, ground_truth, masks),
-        'collision_rate': compute_collision_rate(predicted, masks)
+    # sensible default: if not provided and we have enough dims, assume angle is at index 6
+    if heading_idx is None:
+        heading_idx = 6 if predicted.shape[-1] > 6 else 4
+
+    metrics: Dict[str, float] = {
+        "ade": compute_ade(predicted, ground_truth, masks),
+        "fde": compute_fde(predicted, ground_truth, masks),
+        "velocity_error": compute_velocity_error(predicted, ground_truth, masks),
+        "heading_error": compute_heading_error(predicted, ground_truth, masks, heading_idx=heading_idx),
+        "collision_rate": compute_collision_rate(
+            predicted, masks, safety_margin=safety_margin, mode=collision_mode, zero_pos_eps=zero_pos_eps
+        ),
     }
 
     if predicted_existence is not None:
-        existence_metrics = compute_existence_metrics(predicted_existence, masks)
-        metrics.update({
-            'existence_precision': existence_metrics['precision'],
-            'existence_recall': existence_metrics['recall'],
-            'existence_f1': existence_metrics['f1']
-        })
+        ex = compute_existence_metrics(predicted_existence, masks)
+        metrics.update(
+            {
+                "existence_precision": ex["precision"],
+                "existence_recall": ex["recall"],
+                "existence_f1": ex["f1"],
+            }
+        )
 
     return metrics
 
 
-if __name__ == '__main__':
-    # Test metrics
-    B, T, K, F = 4, 10, 20, 6
-
+if __name__ == "__main__":
+    # quick sanity check
+    B, T, K, F = 2, 5, 6, 12
     predicted = torch.randn(B, T, K, F)
-    ground_truth = torch.randn(B, T, K, F)
-    masks = torch.randint(0, 2, (B, T, K)).float()
+    gt = torch.randn(B, T, K, F)
+    masks = (torch.rand(B, T, K) > 0.3).float()
 
-    metrics = compute_all_metrics(predicted, ground_truth, masks)
-
-    print("Metrics:")
-    for key, value in metrics.items():
-        print(f"  {key}: {value:.4f}")
+    out = compute_all_metrics(
+        predicted, gt, masks,
+        heading_idx=6,
+        collision_mode="frame",
+        convert_to_meters=False,
+    )
+    for k, v in out.items():
+        print(k, v)

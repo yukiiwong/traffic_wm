@@ -473,9 +473,22 @@ def main() -> None:
         running = 0.0
         n = 0
 
-        for batch in pbar:
+        for bi, batch in enumerate(pbar):
             states = batch["states"].to(device)
-            masks = batch["masks"].to(device)
+            masks  = batch["masks"].to(device)
+
+            # ====== DEBUG CHECK (run once) ======
+            if epoch == 0 and bi == 0:
+                assert states.ndim == 4 and masks.ndim == 3
+                assert states.shape[:3] == masks.shape
+                assert states.shape[-1] == args.input_dim, (states.shape[-1], args.input_dim)
+                print("mask ratio:", masks.float().mean().item(), "state dim:", states.shape[-1])
+                print("states:", states.shape, "masks:", masks.shape)
+                print("mask min/max:", masks.min().item(), masks.max().item())
+                print("states finite ratio:", torch.isfinite(states).float().mean().item())
+                # 看看 mask=0 的地方 states 是否被置零（很多实现会这样做）
+                print("masked states abs mean:", states[masks==0].abs().mean().item())
+            # ====================================
 
             optimizer.zero_grad(set_to_none=True)
             preds = model(states, masks)

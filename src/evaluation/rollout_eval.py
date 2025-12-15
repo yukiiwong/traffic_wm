@@ -1,7 +1,13 @@
 """
 Rollout Evaluation Utilities
 
-Evaluate multi-step prediction performance.
+Evaluate multi-step prediction performance for WorldModel.rollout.
+
+This file supports TWO types of --stats_path:
+1) a real stats .npz that contains keys 'mean' and 'std'
+2) a train_episodes .npz that does NOT contain 'mean/std'
+   -> compute mean/std from it on the fly (continuous features only, masked)
+   -> write a temporary stats file under output_dir
 """
 
 import sys
@@ -13,399 +19,450 @@ sys.path.insert(0, str(project_root))
 
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
 
 from src.evaluation.prediction_metrics import compute_all_metrics
 from src.utils.common import get_pixel_to_meter_conversion
 
 
+# ---------------------------
+# Helpers
+# ---------------------------
+def _average_metrics(all_metrics: List[Dict[str, float]]) -> Dict[str, float]:
+    if len(all_metrics) == 0:
+        return {}
+    avg: Dict[str, float] = {}
+    for k in all_metrics[0].keys():
+        avg[k] = sum(m[k] for m in all_metrics) / len(all_metrics)
+    return avg
+
+
+def _infer_embedding_sizes_from_ckpt(state_dict: dict) -> Tuple[int, int, int]:
+    """Infer num_lanes/num_sites/num_classes from checkpoint weights to avoid size mismatch."""
+    num_lanes = (
+        state_dict["encoder.lane_embedding.weight"].shape[0]
+        if "encoder.lane_embedding.weight" in state_dict
+        else 100
+    )
+    num_sites = (
+        state_dict["encoder.site_embedding.weight"].shape[0]
+        if "encoder.site_embedding.weight" in state_dict
+        else 10
+    )
+    num_classes = (
+        state_dict["encoder.class_embedding.weight"].shape[0]
+        if "encoder.class_embedding.weight" in state_dict
+        else 10
+    )
+    return int(num_lanes), int(num_sites), int(num_classes)
+
+
+def _resolve_indices(metadata: dict, loader) -> Tuple[List[int], List[int]]:
+    """
+    Resolve continuous/discrete indices.
+
+    Priority:
+    1) dataset attributes (if present)
+    2) metadata.validation_info discrete_features (if present)
+    3) fallback defaults
+    """
+    cont = None
+    disc = None
+
+    ds = getattr(loader, "dataset", None)
+    if ds is not None:
+        cont = getattr(ds, "continuous_indices", None)
+        disc = getattr(ds, "discrete_indices", None)
+
+    vi = metadata.get("validation_info", {}) if metadata is not None else {}
+
+    # Build discrete from metadata if present
+    if disc is None and "discrete_features" in vi:
+        df = vi["discrete_features"]
+        disc = [int(df["class_id"]), int(df["lane_id"]), int(df["site_id"])]
+
+    # continuous indices are not explicitly stored in your metadata snippet
+    if cont is None:
+        cont = [0, 1, 2, 3, 4, 5, 6, 9, 10]
+    if disc is None:
+        disc = [7, 8, 11]
+
+    return list(map(int, cont)), list(map(int, disc))
+
+
+def _gt_to_continuous_order(gt_full: torch.Tensor, continuous_indices: List[int]) -> torch.Tensor:
+    """FULL gt [B,T,K,F_full] -> continuous-only [B,T,K,F_cont] in order of continuous_indices."""
+    return gt_full[..., continuous_indices]
+
+
+def _load_stats_or_compute_from_episodes(
+    stats_path: str,
+    output_dir: Path,
+    continuous_indices: List[int],
+) -> Tuple[str, torch.Tensor, torch.Tensor]:
+    """
+    If stats_path contains mean/std, load them.
+    Otherwise treat stats_path as train_episodes.npz and compute mean/std using masks.
+
+    Returns:
+      (resolved_stats_path, mean_cont_tensor, std_cont_tensor)
+    """
+    import numpy as np
+
+    z = np.load(stats_path, allow_pickle=True)
+
+    # Case 1: real stats file
+    if "mean" in z.files and "std" in z.files:
+        mean = z["mean"]
+        std = z["std"]
+        mean_t = torch.tensor(mean, dtype=torch.float32)
+        std_t = torch.tensor(std, dtype=torch.float32).clamp(min=1e-6)
+        return stats_path, mean_t, std_t
+
+    # Case 2: episodes file -> compute stats
+    if "states" not in z.files or "masks" not in z.files:
+        raise KeyError(
+            f"{stats_path} has no mean/std and also doesn't have ('states','masks'). "
+            f"Found keys: {z.files}"
+        )
+
+    states = z["states"]  # [N,T,K,F]
+    masks = z["masks"]    # [N,T,K]
+    m = masks > 0.5
+
+    mean_list = []
+    std_list = []
+
+    for feat_idx in continuous_indices:
+        vals = states[..., feat_idx][m]
+        if vals.size == 0:
+            raise RuntimeError(f"No valid values for feature {feat_idx} when computing stats from {stats_path}.")
+        vals = vals.astype(np.float64)
+        mu = vals.mean()
+        sd = vals.std(ddof=0)
+        if sd < 1e-6:
+            sd = 1e-6
+        mean_list.append(mu)
+        std_list.append(sd)
+
+    mean = np.asarray(mean_list, dtype=np.float32)
+    std = np.asarray(std_list, dtype=np.float32)
+
+    computed_path = output_dir / "computed_train_stats.npz"
+    np.savez(computed_path, mean=mean, std=std)
+    print(f"✅ Computed mean/std from episodes and wrote stats to: {computed_path}")
+
+    mean_t = torch.tensor(mean, dtype=torch.float32)
+    std_t = torch.tensor(std, dtype=torch.float32).clamp(min=1e-6)
+    return str(computed_path), mean_t, std_t
+
+
+# ---------------------------
+# Evaluation functions (EXPORTED)
+# ---------------------------
 def evaluate_rollout(
     model: nn.Module,
     data_loader,
+    continuous_indices: List[int],
+    discrete_indices: List[int],
     context_length: int = 10,
     rollout_length: int = 20,
-    device: torch.device = torch.device('cpu'),
+    device: torch.device = torch.device("cpu"),
     pixel_to_meter: Optional[float] = None,
-    convert_to_meters: bool = True
+    convert_to_meters: bool = True,
 ) -> Dict[str, float]:
-    """
-    Evaluate model on multi-step rollout.
-
-    Args:
-        model: Trained world model
-        data_loader: DataLoader with test data
-        context_length: Number of context frames
-        rollout_length: Number of frames to predict
-        device: Device to run on
-        pixel_to_meter: Conversion factor from pixels to meters.
-                       If None and convert_to_meters=True, will auto-load.
-        convert_to_meters: If True, convert coordinates from pixels to meters
-                          before computing metrics (default: True)
-
-    Returns:
-        Dictionary of evaluation metrics (in meters if convert_to_meters=True)
-    """
     model.eval()
-
-    all_metrics = []
+    all_metrics: List[Dict[str, float]] = []
 
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Evaluating Rollout"):
-            states = batch['states'].to(device)  # [B, T, K, F]
-            masks = batch['masks'].to(device)    # [B, T, K]
+            states_full = batch["states"].to(device)  # [B,T,K,F_full]
+            masks = batch["masks"].to(device)         # [B,T,K]
 
-            B, T, K, F = states.shape
-
-            # Ensure we have enough frames
+            B, T, K, F_full = states_full.shape
             if T < context_length + rollout_length:
                 continue
 
-            # Split into context and target
-            context_states = states[:, :context_length]
+            context_states = states_full[:, :context_length]
             context_masks = masks[:, :context_length]
 
-            target_states = states[:, context_length:context_length + rollout_length]
+            target_full = states_full[:, context_length:context_length + rollout_length]
             target_masks = masks[:, context_length:context_length + rollout_length]
+            target_cont = _gt_to_continuous_order(target_full, continuous_indices)
 
-            # Perform rollout
-            rollout_output = model.rollout(
+            pred_cont, _pred_masks = model.rollout(
                 initial_states=context_states,
                 initial_masks=context_masks,
+                continuous_indices=continuous_indices,
+                discrete_indices=discrete_indices,
                 n_steps=rollout_length,
-                teacher_forcing=False
+                teacher_forcing=False,
             )
 
-            predicted_states = rollout_output['predicted_states']
-
-            # Compute metrics
             metrics = compute_all_metrics(
-                predicted=predicted_states,
-                ground_truth=target_states,
+                predicted=pred_cont,
+                ground_truth=target_cont,
                 masks=target_masks,
                 pixel_to_meter=pixel_to_meter,
-                convert_to_meters=convert_to_meters
+                convert_to_meters=convert_to_meters,
             )
-
             all_metrics.append(metrics)
 
-    # Average metrics across batches
-    avg_metrics = {}
-    for key in all_metrics[0].keys():
-        avg_metrics[key] = sum(m[key] for m in all_metrics) / len(all_metrics)
-
-    return avg_metrics
+    return _average_metrics(all_metrics)
 
 
 def evaluate_multihorizon(
     model: nn.Module,
     data_loader,
+    continuous_indices: List[int],
+    discrete_indices: List[int],
     context_length: int = 10,
     horizons: List[int] = [1, 3, 5, 10, 20],
-    device: torch.device = torch.device('cpu'),
+    device: torch.device = torch.device("cpu"),
     pixel_to_meter: Optional[float] = None,
-    convert_to_meters: bool = True
+    convert_to_meters: bool = True,
 ) -> Dict[int, Dict[str, float]]:
-    """
-    Evaluate at multiple prediction horizons.
-
-    Args:
-        model: Trained world model
-        data_loader: DataLoader with test data
-        context_length: Number of context frames
-        horizons: List of prediction horizons to evaluate
-        device: Device to run on
-        pixel_to_meter: Conversion factor from pixels to meters.
-                       If None and convert_to_meters=True, will auto-load.
-        convert_to_meters: If True, convert coordinates from pixels to meters
-                          before computing metrics (default: True)
-
-    Returns:
-        Dictionary mapping horizon to metrics (in meters if convert_to_meters=True)
-    """
     model.eval()
-
-    results = {h: [] for h in horizons}
+    results: Dict[int, List[Dict[str, float]]] = {h: [] for h in horizons}
 
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Multi-horizon Evaluation"):
-            states = batch['states'].to(device)
-            masks = batch['masks'].to(device)
+            states_full = batch["states"].to(device)
+            masks = batch["masks"].to(device)
 
-            B, T, K, F = states.shape
-
-            max_horizon = max(horizons)
-            if T < context_length + max_horizon:
+            B, T, K, F_full = states_full.shape
+            max_h = max(horizons)
+            if T < context_length + max_h:
                 continue
 
-            # Context
-            context_states = states[:, :context_length]
+            context_states = states_full[:, :context_length]
             context_masks = masks[:, :context_length]
 
-            # Rollout for max horizon
-            rollout_output = model.rollout(
+            pred_cont_all, _ = model.rollout(
                 initial_states=context_states,
                 initial_masks=context_masks,
-                n_steps=max_horizon,
-                teacher_forcing=False
+                continuous_indices=continuous_indices,
+                discrete_indices=discrete_indices,
+                n_steps=max_h,
+                teacher_forcing=False,
             )
 
-            predicted_states = rollout_output['predicted_states']
-
-            # Evaluate at each horizon
             for h in horizons:
-                pred_h = predicted_states[:, :h]
-                target_h = states[:, context_length:context_length + h]
+                pred_h = pred_cont_all[:, :h]
+                target_full_h = states_full[:, context_length:context_length + h]
+                target_cont_h = _gt_to_continuous_order(target_full_h, continuous_indices)
                 mask_h = masks[:, context_length:context_length + h]
 
                 metrics = compute_all_metrics(
                     predicted=pred_h,
-                    ground_truth=target_h,
+                    ground_truth=target_cont_h,
                     masks=mask_h,
                     pixel_to_meter=pixel_to_meter,
-                    convert_to_meters=convert_to_meters
+                    convert_to_meters=convert_to_meters,
                 )
-
                 results[h].append(metrics)
 
-    # Average across batches
-    avg_results = {}
-    for h in horizons:
-        if len(results[h]) > 0:
-            avg_results[h] = {}
-            for key in results[h][0].keys():
-                avg_results[h][key] = sum(m[key] for m in results[h]) / len(results[h])
-
-    return avg_results
+    return {h: _average_metrics(results[h]) for h in horizons}
 
 
 def evaluate_with_teacher_forcing(
     model: nn.Module,
     data_loader,
+    continuous_indices: List[int],
+    discrete_indices: List[int],
     context_length: int = 10,
     rollout_length: int = 20,
-    device: torch.device = torch.device('cpu'),
+    device: torch.device = torch.device("cpu"),
     pixel_to_meter: Optional[float] = None,
-    convert_to_meters: bool = True
+    convert_to_meters: bool = True,
 ) -> Dict[str, Dict[str, float]]:
-    """
-    Compare open-loop (no teacher forcing) vs closed-loop (teacher forcing).
-
-    Args:
-        model: Trained world model
-        data_loader: DataLoader with test data
-        context_length: Number of context frames
-        rollout_length: Number of frames to predict
-        device: Device to run on
-        pixel_to_meter: Conversion factor from pixels to meters.
-                       If None and convert_to_meters=True, will auto-load.
-        convert_to_meters: If True, convert coordinates from pixels to meters
-                          before computing metrics (default: True)
-
-    Returns:
-        Dictionary with 'open_loop' and 'closed_loop' metrics (in meters if convert_to_meters=True)
-    """
     model.eval()
-
-    open_loop_metrics = []
-    closed_loop_metrics = []
+    open_loop_metrics: List[Dict[str, float]] = []
+    closed_loop_metrics: List[Dict[str, float]] = []
 
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Teacher Forcing Evaluation"):
-            states = batch['states'].to(device)
-            masks = batch['masks'].to(device)
+            states_full = batch["states"].to(device)
+            masks = batch["masks"].to(device)
 
-            B, T, K, F = states.shape
-
+            B, T, K, F_full = states_full.shape
             if T < context_length + rollout_length:
                 continue
 
-            context_states = states[:, :context_length]
+            context_states = states_full[:, :context_length]
             context_masks = masks[:, :context_length]
 
-            target_states = states[:, context_length:context_length + rollout_length]
+            target_full = states_full[:, context_length:context_length + rollout_length]
             target_masks = masks[:, context_length:context_length + rollout_length]
+            target_cont = _gt_to_continuous_order(target_full, continuous_indices)
 
-            full_states = states[:, :context_length + rollout_length]
+            full_states = states_full[:, :context_length + rollout_length]
 
-            # Open-loop (autoregressive)
-            open_loop_output = model.rollout(
+            # open-loop
+            open_pred_cont, _ = model.rollout(
                 initial_states=context_states,
                 initial_masks=context_masks,
+                continuous_indices=continuous_indices,
+                discrete_indices=discrete_indices,
                 n_steps=rollout_length,
-                teacher_forcing=False
+                teacher_forcing=False,
             )
-
-            open_loop_pred = open_loop_output['predicted_states']
             open_metrics = compute_all_metrics(
-                predicted=open_loop_pred,
-                ground_truth=target_states,
+                predicted=open_pred_cont,
+                ground_truth=target_cont,
                 masks=target_masks,
                 pixel_to_meter=pixel_to_meter,
-                convert_to_meters=convert_to_meters
+                convert_to_meters=convert_to_meters,
             )
             open_loop_metrics.append(open_metrics)
 
-            # Closed-loop (teacher forcing)
-            closed_loop_output = model.rollout(
+            # teacher forcing
+            closed_pred_cont, _ = model.rollout(
                 initial_states=context_states,
                 initial_masks=context_masks,
+                continuous_indices=continuous_indices,
+                discrete_indices=discrete_indices,
                 n_steps=rollout_length,
                 teacher_forcing=True,
-                ground_truth_states=full_states
+                ground_truth_states=full_states,
             )
-
-            closed_loop_pred = closed_loop_output['predicted_states']
             closed_metrics = compute_all_metrics(
-                predicted=closed_loop_pred,
-                ground_truth=target_states,
+                predicted=closed_pred_cont,
+                ground_truth=target_cont,
                 masks=target_masks,
                 pixel_to_meter=pixel_to_meter,
-                convert_to_meters=convert_to_meters
+                convert_to_meters=convert_to_meters,
             )
             closed_loop_metrics.append(closed_metrics)
 
-    # Average
-    def average_metrics(metric_list):
-        if len(metric_list) == 0:
-            return {}
-        avg = {}
-        for key in metric_list[0].keys():
-            avg[key] = sum(m[key] for m in metric_list) / len(metric_list)
-        return avg
-
-    return {
-        'open_loop': average_metrics(open_loop_metrics),
-        'closed_loop': average_metrics(closed_loop_metrics)
-    }
+    return {"open_loop": _average_metrics(open_loop_metrics), "closed_loop": _average_metrics(closed_loop_metrics)}
 
 
-if __name__ == '__main__':
+# ---------------------------
+# Main
+# ---------------------------
+if __name__ == "__main__":
     import argparse
     import json
-    import numpy as np
     from src.models.world_model import WorldModel
     from src.data.dataset import get_dataloader
 
-    parser = argparse.ArgumentParser(description='Evaluate world model with rollout')
-    parser.add_argument('--checkpoint', type=str, required=True, help='Path to model checkpoint')
-    parser.add_argument('--test_data', type=str, required=True, help='Path to test data NPZ file')
-    parser.add_argument('--metadata', type=str, default='data/processed/metadata.json', help='Path to metadata.json')
-    parser.add_argument('--stats_path', type=str, default='data/processed/train_stats.npz', help='Path to training statistics')
-    parser.add_argument('--context_length', type=int, default=65, help='Number of context frames (default: 65)')
-    parser.add_argument('--rollout_horizon', type=int, default=15, help='Number of frames to predict (default: 15)')
-    parser.add_argument('--batch_size', type=int, default=8, help='Batch size for evaluation')
-    parser.add_argument('--output_dir', type=str, default='results/', help='Directory to save results')
-    parser.add_argument('--convert_to_meters', action='store_true', default=True, help='Convert to meters (default: True)')
+    parser = argparse.ArgumentParser(description="Evaluate world model with rollout")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to model checkpoint")
+    parser.add_argument("--test_data", type=str, required=True, help="Path to test data NPZ file")
+    parser.add_argument("--metadata", type=str, default="data/processed/metadata.json", help="Path to metadata.json")
+    # can be stats.npz (mean/std) OR train_episodes.npz (compute stats)
+    parser.add_argument(
+        "--stats_path",
+        type=str,
+        default="data/processed/train_stats.npz",
+        help="Path to stats .npz (mean/std) OR train_episodes .npz to compute stats",
+    )
+    parser.add_argument("--context_length", type=int, default=65, help="Number of context frames (default: 65)")
+    parser.add_argument("--rollout_horizon", type=int, default=15, help="Number of frames to predict (default: 15)")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for evaluation")
+    parser.add_argument("--output_dir", type=str, default="results/", help="Directory to save results")
+    parser.add_argument("--convert_to_meters", action="store_true", default=True, help="Convert to meters (default: True)")
 
     args = parser.parse_args()
 
-    # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load metadata
-    with open(args.metadata, 'r') as f:
+    # metadata
+    with open(args.metadata, "r") as f:
         metadata = json.load(f)
 
-    n_features = metadata['n_features']
-    n_lanes = metadata['validation_info']['num_lanes']
+    n_features = int(metadata.get("n_features", 12))
 
     print(f"Loading checkpoint: {args.checkpoint}")
     print(f"Test data: {args.test_data}")
     print(f"Context length: {args.context_length}")
     print(f"Rollout horizon: {args.rollout_horizon}")
-    print(f"Features: {n_features}, Lanes: {n_lanes}")
+    print(f"Features: {n_features}")
 
-    # Load checkpoint
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint = torch.load(args.checkpoint, map_location=device)
+    state_dict = checkpoint["model_state_dict"]
 
-    # Extract model configuration from checkpoint
-    if 'config' in checkpoint:
-        config = checkpoint['config']
-        input_dim = config.get('input_dim', n_features)
-        latent_dim = config.get('latent_dim', 256)
-        dynamics_type = config.get('dynamics_type', 'gru')
+    # infer dims from checkpoint
+    if "config" in checkpoint:
+        cfg = checkpoint["config"]
+        input_dim = int(cfg.get("input_dim", n_features))
+        latent_dim = int(cfg.get("latent_dim", 256))
     else:
-        # Try to infer from checkpoint state_dict
         print("Warning: No config found in checkpoint, inferring from state_dict")
-        state_dict = checkpoint['model_state_dict']
-
-        # Infer latent_dim from encoder.to_latent.0.bias shape
-        if 'encoder.to_latent.0.bias' in state_dict:
-            latent_dim = state_dict['encoder.to_latent.0.bias'].shape[0]
+        input_dim = n_features
+        if "encoder.to_latent.0.bias" in state_dict:
+            latent_dim = int(state_dict["encoder.to_latent.0.bias"].shape[0])
             print(f"  Inferred latent_dim: {latent_dim}")
         else:
             latent_dim = 256
             print(f"  Could not infer latent_dim, using default: {latent_dim}")
 
-        # Infer dynamics_type and hidden_dim from checkpoint keys and weight shapes
-        dynamics_keys = [k for k in state_dict.keys() if k.startswith('dynamics.')]
-        dynamics_hidden = 512  # default
+    num_lanes_ckpt, num_sites_ckpt, num_classes_ckpt = _infer_embedding_sizes_from_ckpt(state_dict)
+    print(f"✅ Using embedding sizes from checkpoint: num_lanes={num_lanes_ckpt}, num_sites={num_sites_ckpt}, num_classes={num_classes_ckpt}")
 
-        if any('transformer' in k for k in dynamics_keys):
-            dynamics_type = 'transformer'
-        elif any('rnn.weight_ih_l0' in k for k in dynamics_keys):
-            # Check weight shape to distinguish LSTM (4x) from GRU (3x)
-            weight_key = [k for k in dynamics_keys if 'rnn.weight_ih_l0' in k][0]
-            weight_shape = state_dict[weight_key].shape
-            # weight_shape[0] = hidden_dim * num_gates
-            # weight_shape[1] = latent_dim (input size)
-
-            # Try to infer: ratio = hidden_dim * num_gates / latent_dim
-            total_hidden = weight_shape[0]
-            input_size = weight_shape[1]
-
-            # Assume input_size == latent_dim
-            if abs(total_hidden / input_size - 4.0) < 0.1:  # LSTM has 4 gates
-                dynamics_type = 'lstm'
-                dynamics_hidden = total_hidden // 4
-            elif abs(total_hidden / input_size - 3.0) < 0.1:  # GRU has 3 gates
-                dynamics_type = 'gru'
-                dynamics_hidden = total_hidden // 3
-            else:
-                print(f"  Warning: Unexpected ratio {total_hidden / input_size:.1f}, defaulting to GRU")
-                dynamics_type = 'gru'
-                dynamics_hidden = total_hidden // 3
-
-            print(f"  Inferred hidden_dim: {dynamics_hidden}")
-        else:
-            dynamics_type = 'gru'
-        print(f"  Inferred dynamics_type: {dynamics_type}")
-
-        input_dim = n_features
-
-    # Create model with inferred or config parameters
-    if 'config' in checkpoint:
-        model = WorldModel(
-            input_dim=input_dim,
-            latent_dim=latent_dim,
-            dynamics_type=dynamics_type,
-            dynamics_hidden=config.get('dynamics_hidden', 512)
-        )
-    else:
-        model = WorldModel(
-            input_dim=input_dim,
-            latent_dim=latent_dim,
-            dynamics_type=dynamics_type,
-            dynamics_hidden=dynamics_hidden
-        )
-    model.load_state_dict(checkpoint['model_state_dict'])
+    model = WorldModel(
+        input_dim=input_dim,
+        latent_dim=latent_dim,
+        num_lanes=num_lanes_ckpt,
+        num_sites=num_sites_ckpt,
+        num_classes=num_classes_ckpt,
+    )
+    model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
 
-    print(f"Model loaded: {dynamics_type}, latent_dim={latent_dim}")
+    # continuous/discrete indices (use metadata fallback here)
+    vi = metadata.get("validation_info", {})
+    if "discrete_features" in vi:
+        df = vi["discrete_features"]
+        discrete_indices_fallback = [int(df["class_id"]), int(df["lane_id"]), int(df["site_id"])]
+    else:
+        discrete_indices_fallback = [7, 8, 11]
+    continuous_indices_fallback = [0, 1, 2, 3, 4, 5, 6, 9, 10]
 
-    # Load data
+    # compute/load stats (fallback indices)
+    resolved_stats_path, mean_cont_t, std_cont_t = _load_stats_or_compute_from_episodes(
+        stats_path=args.stats_path,
+        output_dir=output_dir,
+        continuous_indices=continuous_indices_fallback,
+    )
+
+    # dataloader (dataset.py needs a real stats file with mean/std)
     test_loader = get_dataloader(
         data_path=args.test_data,
         batch_size=args.batch_size,
         shuffle=False,
-        stats_path=args.stats_path
+        stats_path=resolved_stats_path,
     )
 
-    # Get pixel to meter conversion
+    # resolve indices from dataset/metadata
+    continuous_indices, discrete_indices = _resolve_indices(metadata, test_loader)
+    print(f"Using continuous_indices: {continuous_indices}")
+    print(f"Using discrete_indices: {discrete_indices}")
+
+    # if indices differ, recompute stats & rebuild loader
+    if continuous_indices != continuous_indices_fallback:
+        resolved_stats_path, mean_cont_t, std_cont_t = _load_stats_or_compute_from_episodes(
+            stats_path=args.stats_path,
+            output_dir=output_dir,
+            continuous_indices=continuous_indices,
+        )
+        test_loader = get_dataloader(
+            data_path=args.test_data,
+            batch_size=args.batch_size,
+            shuffle=False,
+            stats_path=resolved_stats_path,
+        )
+
+    # set stats into model for kinematic prior
+    model.set_normalization_stats(mean_cont_t.cpu().numpy(), std_cont_t.cpu().numpy(), continuous_indices)
+    print("✅ set_normalization_stats() applied (cont_index_map initialized)")
+
+    # pixel-to-meter
     pixel_to_meter = None
     if args.convert_to_meters:
         try:
@@ -416,47 +473,57 @@ if __name__ == '__main__':
             print("Metrics will be in pixels")
             args.convert_to_meters = False
 
-    # Evaluate
-    print("\n" + "="*60)
+    # evaluate
+    print("\n" + "=" * 60)
     print("Starting Rollout Evaluation")
-    print("="*60)
+    print("=" * 60)
 
     metrics = evaluate_rollout(
         model=model,
         data_loader=test_loader,
+        continuous_indices=continuous_indices,
+        discrete_indices=discrete_indices,
         context_length=args.context_length,
         rollout_length=args.rollout_horizon,
         device=device,
         pixel_to_meter=pixel_to_meter,
-        convert_to_meters=args.convert_to_meters
+        convert_to_meters=args.convert_to_meters,
     )
 
-    # Print results
     units = "meters" if args.convert_to_meters else "pixels"
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print(f"Rollout Evaluation Results ({units})")
-    print("="*60)
-    for key, value in metrics.items():
-        print(f"  {key}: {value:.4f}")
+    print("=" * 60)
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.4f}")
 
-    # Save results
-    results_file = output_dir / 'rollout_metrics.json'
+    # save
+    results_file = output_dir / "rollout_metrics.json"
     results = {
-        'metrics': metrics,
-        'config': {
-            'checkpoint': args.checkpoint,
-            'test_data': args.test_data,
-            'context_length': args.context_length,
-            'rollout_horizon': args.rollout_horizon,
-            'convert_to_meters': args.convert_to_meters,
-            'units': units,
-            'model_type': dynamics_type,
-            'latent_dim': latent_dim
-        }
+        "metrics": metrics,
+        "config": {
+            "checkpoint": args.checkpoint,
+            "test_data": args.test_data,
+            "metadata": args.metadata,
+            "stats_path_arg": args.stats_path,
+            "resolved_stats_path_used": resolved_stats_path,
+            "context_length": args.context_length,
+            "rollout_horizon": args.rollout_horizon,
+            "convert_to_meters": args.convert_to_meters,
+            "units": units,
+            "input_dim": input_dim,
+            "latent_dim": latent_dim,
+            "num_lanes_ckpt": num_lanes_ckpt,
+            "num_sites_ckpt": num_sites_ckpt,
+            "num_classes_ckpt": num_classes_ckpt,
+            "continuous_indices": continuous_indices,
+            "discrete_indices": discrete_indices,
+        },
     }
 
-    with open(results_file, 'w') as f:
-        json.dump(results, f, indent=2)
+    import json as _json
+    with open(results_file, "w") as f:
+        _json.dump(results, f, indent=2)
 
     print(f"\nResults saved to: {results_file}")
-    print("="*60)
+    print("=" * 60)
