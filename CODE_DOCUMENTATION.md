@@ -492,6 +492,37 @@ PyTorch Dataset实现,用于训练和评估。
 
 通用工具函数。
 
+**`parse_discrete_feature_indices_from_metadata(metadata: dict) -> Tuple[List[int], Optional[int], Optional[int], Optional[int]]`**
+- **作用**: 从 metadata 中解析离散特征索引 (集中化解析逻辑)
+- **参数**: metadata dict (包含 validation_info 字段)
+- **返回**: 
+  ```python
+  (
+      discrete_indices: [7, 8, 11],  # sorted list
+      idx_lane: 8,                    # lane_id index
+      idx_class: 7,                   # class_id index  
+      idx_site: 11                    # site_id index
+  )
+  ```
+- **Fallback**: 如果 metadata 缺失字段，返回 `([7, 8, 11], 8, 7, 11)` (默认值)
+- **用途**: 所有训练/评估脚本使用此函数统一解析，避免重复代码
+- **代码位置**: `src/utils/common.py`
+- **示例**:
+  ```python
+  # 在训练脚本中
+  meta = train_loader.dataset.metadata
+  discrete_indices, idx_lane, idx_class, idx_site = \
+      parse_discrete_feature_indices_from_metadata(meta)
+  
+  # 传递给 WorldModel
+  model = WorldModel(
+      ...,
+      lane_feature_idx=idx_lane,
+      class_feature_idx=idx_class,
+      site_feature_idx=idx_site
+  )
+  ```
+
 **`set_seed(seed: int = 42)`**
 - **作用**: 设置所有随机种子确保可复现
 - **设置**: random, numpy, torch (CPU + CUDA), cudnn
@@ -1011,12 +1042,13 @@ PyTorch Dataset实现,用于训练和评估。
   - `max_dynamics_len=512`: Transformer最大序列长度
   - `max_dynamics_context=128`: Rollout时截断上下文长度
   - 特征索引: `idx_x=0`, `idx_y=1`, `idx_vx=2`, `idx_vy=3`, `idx_ax=4`, `idx_ay=5`
+  - 🔥 `idx_angle=6`: **angle特征索引** (新增)
   - `use_acceleration=True`: 是否使用加速度
   - Embedding配置: `num_lanes`, `num_sites`, `num_classes`, 各自的`embed_dim`
 - **组件初始化**:
   1. **Encoder** (L71-85): MultiAgentEncoder
   2. **Dynamics** (L88-93): LatentDynamics (Transformer-only)
-  3. **Decoder** (L96-102): StateDecoder (enable_xy_residual=True)
+  3. **Decoder** (L96-102): StateDecoder (enable_xy_residual=True, 🔥 enable_angle_head=True)
   4. **Normalization buffers** (L105-108):
      ```python
      register_buffer("norm_mean_cont", zeros(1))
@@ -1077,6 +1109,24 @@ PyTorch Dataset实现,用于训练和评估。
   return stack([x_next_norm, y_next_norm], dim=-1)  # [B,T,K,2]
   ```
 - **关键**: 物理计算在原始空间进行,确保正确性
+
+🔥 **`_kinematic_prior_angle(prev_states: [B,T,K,F]) -> [B,T,K]`** (新增)
+- **作用**: 计算angle的物理先验 (基于速度方向)
+- **算法**:
+  ```python
+  # 1. Denormalize速度
+  vx = _denorm(prev_states[..., idx_vx], idx_vx)
+  vy = _denorm(prev_states[..., idx_vy], idx_vy)
+  
+  # 2. 计算速度方向角 (即朝向角的先验)
+  angle_prior = torch.atan2(vy, vx)  # [-π, π]
+  
+  # 3. 不需要 renormalize (因为 angle 不被归一化)
+  return angle_prior  # [B,T,K]
+  ```
+- **物理意义**: 车辆朝向 ≈ 速度方向 (很强的物理约束)
+- **处理边界**: 当 `vx ≈ 0, vy ≈ 0` 时 `atan2` 仍然有定义 (返回0)
+- **使用**: 在 `forward()` 中与 decoder 预测混合
 
 **`forward(states: [B,T,K,F], masks: [B,T,K]) -> Dict`** (L173-215)
 - **作用**: 模型前向传播
@@ -1261,6 +1311,39 @@ World Model的Loss函数实现。
   # mask: 1=agent存在, 0=padding
   return loss.mean()
   ```
+
+🔥 **`_angular_distance(pred_angle: [B,T,K], target_angle: [B,T,K]) -> [B,T,K]`** (static, 新增)
+- **作用**: 计算周期性角度距离 (处理 `-π` 和 `π` 的等价性)
+- **算法**:
+  ```python
+  diff = pred_angle - target_angle  # 可能超出 [-π, π]
+  
+  # 将差值映射到 [-π, π]
+  distance = torch.atan2(torch.sin(diff), torch.cos(diff))
+  # atan2(sin, cos) 自动处理周期性
+  
+  return distance.abs()  # [B,T,K] 非负距离
+  ```
+- **例子**:
+  - `pred=3.0, target=-3.0`: 传统L1=6.0, angular distance=0.28 ✅
+  - `pred=0.0, target=3.14`: 传统L1=3.14, angular distance=3.14 ✅
+  - `pred=-3.1, target=3.1`: 传统L1=6.2, angular distance=0.08 ✅
+- **优势**: 正确处理角度的周期性，避免梯度爆炸
+
+🔥 **`_angular_loss(pred_angle: [B,T,K], target_angle: [B,T,K], mask: [B,T,K]) -> scalar`** (新增)
+- **作用**: 计算masked angular distance loss
+- **算法**:
+  ```python
+  distance = _angular_distance(pred_angle, target_angle)  # [B,T,K]
+  
+  # 应用mask
+  masked_distance = distance * mask  # [B,T,K]
+  
+  # 平均
+  loss = masked_distance.sum() / mask.sum().clamp(min=1.0)
+  return loss
+  ```
+- **返回**: 平均角度误差 (弧度)
 
 **`forward(predictions: Dict, targets: Dict) -> Dict`** (L67-109)
 - **作用**: 计算总loss和各分项

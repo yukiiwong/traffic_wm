@@ -105,13 +105,25 @@ class TrajectoryDataset(Dataset):
                 validation_info = metadata.get('validation_info', {})
                 discrete_features = validation_info.get('discrete_features', {})
 
+                # Get angle index (should not be normalized with z-score)
+                angle_idx = validation_info.get('angle_idx', None)
+                non_normalized_indices = [v for v in discrete_features.values() if v is not None]
+                if angle_idx is not None:
+                    non_normalized_indices.append(angle_idx)
+
                 if discrete_features:
                     # ✅ FIX: Filter out None values before sorting
                     discrete_values = [v for v in discrete_features.values() if v is not None]
                     self.discrete_indices = sorted(set(discrete_values))
+                    # Continuous features: exclude discrete AND angle
                     self.continuous_indices = [i for i in range(self.F)
-                                                if i not in self.discrete_indices]
+                                                if i not in non_normalized_indices]
                     print(f"Loaded discrete feature indices from metadata: {self.discrete_indices}")
+                    if angle_idx is not None:
+                        print(f"Angle feature at index {angle_idx} will NOT be normalized (periodic)")
+                        self.angle_idx = angle_idx
+                    else:
+                        self.angle_idx = None
 
                     # Load bounds for validation
                     self.num_lanes = validation_info.get('num_lanes', len(metadata.get('lane_mapping', {})))

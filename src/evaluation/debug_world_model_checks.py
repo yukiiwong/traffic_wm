@@ -253,8 +253,9 @@ def main():
 
     # indices must match your training pipeline
     continuous_indices = [0, 1, 2, 3, 4, 5, 6, 9, 10]
-    df = metadata["validation_info"]["discrete_features"]
-    discrete_indices = [int(df["class_id"]), int(df["lane_id"]), int(df["site_id"])]
+    from src.utils.common import parse_discrete_feature_indices_from_metadata
+    lane_idx, class_idx, site_idx = parse_discrete_feature_indices_from_metadata(metadata, fallback=(8, 7, 11), strict=False)
+    discrete_indices = [class_idx, lane_idx, site_idx]
 
     ckpt = torch.load(args.checkpoint, map_location=device)
     state_dict = ckpt["model_state_dict"]
@@ -268,6 +269,9 @@ def main():
         num_lanes=num_lanes,
         num_sites=num_sites,
         num_classes=num_classes,
+        lane_feature_idx=lane_idx,
+        class_feature_idx=class_idx,
+        site_feature_idx=site_idx,
     ).to(device)
     model.load_state_dict(state_dict)
     model.eval()

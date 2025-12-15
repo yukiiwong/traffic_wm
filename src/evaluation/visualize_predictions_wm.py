@@ -363,8 +363,14 @@ def main():
     num_lanes, num_sites, num_classes = infer_embedding_sizes_from_ckpt(state_dict)
     input_dim = int(metadata.get("n_features", 12))
 
+    from src.utils.common import parse_discrete_feature_indices_from_metadata
+    lane_idx, class_idx, site_idx = parse_discrete_feature_indices_from_metadata(metadata, fallback=(8, 7, 11), strict=False)
+
     model = WorldModel(input_dim=input_dim, latent_dim=latent_dim,
-                       num_lanes=num_lanes, num_sites=num_sites, num_classes=num_classes)
+                       num_lanes=num_lanes, num_sites=num_sites, num_classes=num_classes,
+                       lane_feature_idx=lane_idx,
+                       class_feature_idx=class_idx,
+                       site_feature_idx=site_idx)
     model.load_state_dict(state_dict)
     model = model.to(device).eval()
 

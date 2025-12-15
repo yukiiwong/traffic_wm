@@ -421,6 +421,13 @@ def main() -> None:
     continuous_indices = train_loader.dataset.continuous_indices
     discrete_indices = train_loader.dataset.discrete_indices
 
+    # Resolve discrete feature indices from metadata (pass into model to avoid hard-coded defaults)
+    from src.utils.common import parse_discrete_feature_indices_from_metadata
+
+    lane_feature_idx, class_feature_idx, site_feature_idx = parse_discrete_feature_indices_from_metadata(
+        meta, fallback=(8, 7, 11), strict=False
+    )
+
     # Log feature classification
     logger.info("=" * 60)
     logger.info("Feature Classification:")
@@ -445,6 +452,9 @@ def main() -> None:
         num_sites=num_sites,
         num_classes=num_classes,
         use_acceleration=bool(meta.get("use_acceleration", True)),
+        lane_feature_idx=lane_feature_idx,
+        class_feature_idx=class_feature_idx,
+        site_feature_idx=site_feature_idx,
     ).to(device)
 
     # Set normalization stats into the model (needed for kinematic prior)
@@ -454,12 +464,18 @@ def main() -> None:
         train_loader.dataset.continuous_indices,
     )
 
+    # Get angle_idx from metadata (default 6)
+    angle_idx = meta.get('validation_info', {}).get('angle_idx', 6)
+    logger.info(f"Angle feature index: {angle_idx} (will use angular distance loss)")
+
     loss_fn = WorldModelLoss(
         recon_weight=args.recon_weight,
         pred_weight=args.pred_weight,
         exist_weight=args.existence_weight,
+        angle_weight=0.5,  # Weight for angle loss
         huber_beta=1.0,
         continuous_indices=train_loader.dataset.continuous_indices,
+        angle_idx=angle_idx,
         use_pred_existence_loss=True,
     )
 
@@ -514,10 +530,15 @@ def main() -> None:
         )
         val_loss = val_metrics["total_loss"]
 
-        # Log basic losses
+        # Log basic losses (including angle losses)
         logger.info(f"[Epoch {epoch+1}/{args.epochs}] train_loss={running/max(1,n):.4f}  val_loss={val_loss:.4f}  "
                     f"recon={val_metrics['recon_loss']:.4f} pred={val_metrics['pred_loss']:.4f} "
                     f"exist={val_metrics['exist_loss']:.4f} pred_exist={val_metrics['pred_exist_loss']:.4f}")
+        
+        # Log angle losses separately
+        if "recon_angle_loss" in val_metrics and "pred_angle_loss" in val_metrics:
+            logger.info(f"  [ANGLE] recon_angle={val_metrics['recon_angle_loss']:.4f}  "
+                        f"pred_angle={val_metrics['pred_angle_loss']:.4f}")
 
         # Log diagnostics
         if "diag_pred_ADE_xy" in val_metrics:

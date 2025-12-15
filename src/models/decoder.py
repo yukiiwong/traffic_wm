@@ -24,6 +24,7 @@ class StateDecoder(nn.Module):
         max_agents: int = 50,
         dropout: float = 0.1,
         enable_xy_residual: bool = True,
+        enable_angle_head: bool = True,  # Separate head for angle (periodic, non-normalized)
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -32,6 +33,7 @@ class StateDecoder(nn.Module):
         self.continuous_dim = continuous_dim  # Only continuous features
         self.max_agents = max_agents
         self.enable_xy_residual = enable_xy_residual
+        self.enable_angle_head = enable_angle_head
 
         self.backbone = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
@@ -58,20 +60,32 @@ class StateDecoder(nn.Module):
         else:
             self.residual_xy_head = None
 
+        # Angle head (periodic, outputs raw radians, not normalized)
+        if enable_angle_head:
+            self.angle_head = nn.Linear(hidden_dim, max_agents)
+            # Initialize with small weights for stability
+            nn.init.normal_(self.angle_head.weight, mean=0.0, std=0.01)
+            nn.init.zeros_(self.angle_head.bias)
+        else:
+            self.angle_head = None
+
     def forward(
         self,
         latent: torch.Tensor,
         return_residual_xy: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        return_angle: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
         """
         Args:
             latent: [B, T, D]
             return_residual_xy: whether to return residual_xy
+            return_angle: whether to return angle predictions
 
         Returns:
-            states: [B, T, K, F]
+            states: [B, T, K, F_cont] (continuous features excluding angle)
             existence_logits: [B, T, K]
             residual_xy: [B, T, K, 2] or None
+            angle: [B, T, K] or None (raw radians, not normalized)
         """
         if latent.dim() != 3:
             raise ValueError(f"latent must be [B, T, D], got {tuple(latent.shape)}")
@@ -82,7 +96,7 @@ class StateDecoder(nn.Module):
 
         h = self.backbone(latent)  # [B, T, H]
 
-        # Output only continuous features
+        # Output only continuous features (excluding angle)
         states = self.state_head(h).view(B, T, self.max_agents, self.continuous_dim)  # [B, T, K, F_cont]
         existence_logits = self.existence_head(h)  # [B, T, K]
 
@@ -92,4 +106,10 @@ class StateDecoder(nn.Module):
                 raise ValueError("return_residual_xy=True but enable_xy_residual=False")
             residual_xy = self.residual_xy_head(h).view(B, T, self.max_agents, 2)  # [B,T,K,2]
 
-        return states, existence_logits, residual_xy
+        angle = None
+        if return_angle:
+            if not self.enable_angle_head or self.angle_head is None:
+                raise ValueError("return_angle=True but enable_angle_head=False")
+            angle = self.angle_head(h).view(B, T, self.max_agents)  # [B,T,K] raw radians
+
+        return states, existence_logits, residual_xy, angle

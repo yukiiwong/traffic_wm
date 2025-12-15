@@ -9,6 +9,38 @@ import torch.nn as nn
 from typing import Optional
 from pathlib import Path
 import json
+from typing import Dict, Tuple
+
+
+def parse_discrete_feature_indices_from_metadata(
+        metadata: Dict,
+        fallback: Tuple[int, int, int] = (8, 7, 11),  # (lane, class, site)
+        strict: bool = False,
+) -> Tuple[int, int, int]:
+        """
+        Parse discrete feature indices from metadata.json.
+
+        Expected structure:
+            metadata["validation_info"]["discrete_features"] = {
+                 "lane_id": <int>, "class_id": <int>, "site_id": <int>
+            }
+
+        Returns:
+            (lane_feature_idx, class_feature_idx, site_feature_idx)
+
+        strict=True: if keys missing -> raise KeyError
+        """
+        vi = (metadata or {}).get("validation_info", {})
+        df = (vi or {}).get("discrete_features", {})
+
+        if strict and (not isinstance(df, dict) or any(k not in df for k in ("lane_id", "class_id", "site_id"))):
+                raise KeyError("metadata.validation_info.discrete_features missing lane_id/class_id/site_id")
+
+        lane_idx = int(df.get("lane_id", fallback[0]))
+        class_idx = int(df.get("class_id", fallback[1]))
+        site_idx = int(df.get("site_id", fallback[2]))
+
+        return lane_idx, class_idx, site_idx
 
 
 def set_seed(seed: int = 42):

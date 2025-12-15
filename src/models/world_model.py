@@ -43,6 +43,11 @@ class WorldModel(nn.Module):
         idx_vy: int = 3,
         idx_ax: int = 4,
         idx_ay: int = 5,
+        idx_angle: int = 6,  # angle feature index (periodic, not normalized)
+        # discrete feature indices (must be provided from metadata at model construction)
+        lane_feature_idx: int = 8,
+        class_feature_idx: int = 9,
+        site_feature_idx: int = 11,
         use_acceleration: bool = True,
         # embeddings (match your metadata)
         num_lanes: int = 100,
@@ -67,7 +72,27 @@ class WorldModel(nn.Module):
         self.idx_x, self.idx_y = idx_x, idx_y
         self.idx_vx, self.idx_vy = idx_vx, idx_vy
         self.idx_ax, self.idx_ay = idx_ax, idx_ay
+        self.idx_angle = int(idx_angle)
         self.use_acceleration = bool(use_acceleration)
+        # store discrete indices
+        self.lane_feature_idx = int(lane_feature_idx)
+        self.class_feature_idx = int(class_feature_idx)
+        self.site_feature_idx = int(site_feature_idx)
+
+        # Validate discrete indices early to avoid silent misconfiguration
+        def _check_idx(name: str, idx: int, input_dim: int):
+            if not (0 <= int(idx) < int(input_dim)):
+                raise ValueError(f"{name}={idx} out of range [0, {input_dim})")
+
+        _check_idx("lane_feature_idx", self.lane_feature_idx, self.input_dim)
+        _check_idx("class_feature_idx", self.class_feature_idx, self.input_dim)
+        _check_idx("site_feature_idx", self.site_feature_idx, self.input_dim)
+
+        if len({self.lane_feature_idx, self.class_feature_idx, self.site_feature_idx}) != 3:
+            raise ValueError(
+                f"Discrete feature indices must be distinct, got "
+                f"lane={self.lane_feature_idx}, class={self.class_feature_idx}, site={self.site_feature_idx}"
+            )
 
         # Encoder: per-frame agent attention -> pooled scene latent [B,T,D]
         self.encoder = MultiAgentEncoder(
@@ -75,6 +100,9 @@ class WorldModel(nn.Module):
             hidden_dim=latent_dim,
             latent_dim=latent_dim,
             max_agents=max_agents,
+            lane_feature_idx=lane_feature_idx,
+            class_feature_idx=class_feature_idx,
+            site_feature_idx=site_feature_idx,
             num_lanes=num_lanes,
             num_sites=num_sites,
             num_classes=num_classes,
@@ -94,7 +122,7 @@ class WorldModel(nn.Module):
             max_len=max_dynamics_len,
         )
 
-        # Decoder: MLP decoder + residual_xy head (outputs only continuous features)
+        # Decoder: MLP decoder + residual_xy head + angle head (outputs only continuous features excluding angle)
         self.decoder = StateDecoder(
             latent_dim=latent_dim,
             hidden_dim=latent_dim,
@@ -102,6 +130,7 @@ class WorldModel(nn.Module):
             continuous_dim=continuous_dim,
             max_agents=max_agents,
             enable_xy_residual=True,
+            enable_angle_head=True,  # Separate head for angle (raw radians)
         )
 
         # Normalization stats (continuous features only)
@@ -142,6 +171,25 @@ class WorldModel(nn.Module):
         std = self.norm_std_cont[cont_j]
         return mean, std
 
+    def _runtime_check_feature_dim(self, F: int) -> None:
+        """Runtime check to ensure input feature dimension F is compatible with configured indices."""
+        max_idx = max(
+            self.idx_x,
+            self.idx_y,
+            self.idx_vx,
+            self.idx_vy,
+            self.idx_ax,
+            self.idx_ay,
+            self.lane_feature_idx,
+            self.class_feature_idx,
+            self.site_feature_idx,
+        )
+        if F <= max_idx:
+            raise RuntimeError(
+                f"Input feature dim F={F} is incompatible with configured indices (max_idx={max_idx}). "
+                f"Check metadata/feature_layout and model init."
+            )
+
     def _denorm(self, x_norm: torch.Tensor, feat_idx: int) -> torch.Tensor:
         mean, std = self._require_stats(feat_idx)
         return x_norm * std + mean
@@ -173,6 +221,26 @@ class WorldModel(nn.Module):
         y_next_n = self._renorm(y_next, self.idx_y)
         return torch.stack([x_next_n, y_next_n], dim=-1)  # [..., 2]
 
+    def _kinematic_prior_angle(self, prev_states: torch.Tensor) -> torch.Tensor:
+        """
+        Compute angle prior based on velocity direction (physics-based).
+        
+        prev_states: [B, T, K, F] (may be normalized for continuous features, angle is raw)
+        returns: angle_prior: [B, T, K] in radians (raw, not normalized)
+        
+        Note: angle is NOT normalized, so we extract it directly.
+        Velocity needs denormalization if it was normalized.
+        """
+        # Extract velocities (need denormalization if they were normalized)
+        vx = self._denorm(prev_states[..., self.idx_vx], self.idx_vx)
+        vy = self._denorm(prev_states[..., self.idx_vy], self.idx_vy)
+        
+        # Angle prior: direction of velocity vector
+        # atan2(vy, vx) gives angle in [-pi, pi]
+        angle_prior = torch.atan2(vy, vx)  # [B, T, K]
+        
+        return angle_prior
+
     def forward(self, states: torch.Tensor, masks: torch.Tensor) -> Dict[str, torch.Tensor]:
         """
         Args:
@@ -191,6 +259,8 @@ class WorldModel(nn.Module):
               are used as conditioning inputs via embeddings, not predicted as outputs.
         """
         B, T, K, F = states.shape
+        # runtime sanity check for feature layout
+        self._runtime_check_feature_dim(F)
         assert F == self.input_dim, f"Expected F={self.input_dim}, got {F}"
 
         latent = self.encoder(states, masks)  # [B,T,D]
@@ -200,8 +270,11 @@ class WorldModel(nn.Module):
 
         predicted_latent, _ = self.dynamics(latent, time_padding_mask=time_padding)  # [B,T,D]
 
-        recon_states, exist_logits, _ = self.decoder(latent, return_residual_xy=False)
-        pred_states_base, pred_exist_logits, residual_xy = self.decoder(predicted_latent, return_residual_xy=True)
+        # Decoder outputs: continuous states (excluding angle) + angle separately
+        recon_states, exist_logits, _, recon_angle = self.decoder(latent, return_residual_xy=False, return_angle=True)
+        pred_states_base, pred_exist_logits, residual_xy, pred_angle_base = self.decoder(
+            predicted_latent, return_residual_xy=True, return_angle=True
+        )
 
         # Apply kinematic prior + residual to (x,y) for prediction branch
         pred_states = pred_states_base.clone()
@@ -212,10 +285,22 @@ class WorldModel(nn.Module):
             pred_states[..., self.idx_x] = prior_xy[..., 0] + residual_xy[..., 0]
             pred_states[..., self.idx_y] = prior_xy[..., 1] + residual_xy[..., 1]
 
+        # Apply kinematic prior to angle (velocity direction)
+        pred_angle = pred_angle_base  # Start with decoder prediction
+        if pred_angle_base is not None:
+            angle_prior = self._kinematic_prior_angle(states)  # [B,T,K] based on velocity
+            # Blend: use prior as strong guidance, decoder learns residual
+            # For now, simple weighted sum (can make this learnable later)
+            pred_angle = 0.7 * angle_prior + 0.3 * pred_angle_base
+            # Apply mask
+            pred_angle = pred_angle * masks
+
         return {
             "latent": latent,
             "reconstructed_states": recon_states,
             "predicted_states": pred_states,
+            "reconstructed_angle": recon_angle,  # [B,T,K] raw radians
+            "predicted_angle": pred_angle,  # [B,T,K] raw radians with prior
             "existence_logits": exist_logits,
             "predicted_existence_logits": pred_exist_logits,
         }
@@ -255,6 +340,8 @@ class WorldModel(nn.Module):
             - For kinematic prior, we reconstruct full states by combining continuous + discrete
         """
         B, T0, K, F = initial_states.shape
+        # runtime sanity check for feature layout
+        self._runtime_check_feature_dim(F)
 
         # Extract constant discrete features (site_id, class_id, lane_id) from initial states
         # These will remain constant throughout rollout

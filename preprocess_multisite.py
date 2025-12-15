@@ -324,6 +324,8 @@ def preprocess_all_sites(
         idx += 1
 
     # Validation info with correct indices
+    # angle is at index 6 (before class_id at 7, lane_id at 8)
+    angle_idx = 6
     validation_info = {
         'num_lanes': num_lanes,
         'lane_token_format': 'site:lane (e.g., A:A1, B:crossroads1)',
@@ -332,7 +334,8 @@ def preprocess_all_sites(
             'class_id': class_id_idx,
             'site_id': site_id_idx
         },
-        'do_not_normalize': ['lane_id', 'class_id', 'site_id'],
+        'angle_idx': angle_idx,  # angle feature (radian, periodic)
+        'do_not_normalize': ['lane_id', 'class_id', 'site_id', 'angle'],  # angle should not use z-score normalization
         'context_length': episode_length - 15,  # C = T - H
         'rollout_horizon': 15  # H
     }
