@@ -179,7 +179,11 @@ def select_agents_by_error(
 ) -> torch.Tensor:
     """
     Select agents with largest future ADE (pixels).
-    Returns indices [A]
+    
+    This mode shows the WORST predictions - useful for debugging but
+    NOT representative of overall performance.
+    
+    Returns indices [A] of agents with highest prediction errors.
     """
     err = ((pred_xy - gt_xy) ** 2).sum(-1).sqrt()  # [H,K]
     err = err * gt_mask
@@ -190,7 +194,22 @@ def select_agents_by_error(
 
 
 def select_agents_by_presence(gt_mask: torch.Tensor, max_agents: int) -> torch.Tensor:
-    counts = gt_mask.sum(0)  # [K]
+    """
+    Select agents that appear for the longest duration in rollout horizon.
+    
+    This mode shows complete trajectories but tends to select agents with
+    complex motion (since they stay in view longer), which are naturally
+    harder to predict. Still biased towards challenging cases, but more
+    representative than 'error' mode.
+    
+    Args:
+        gt_mask: [H,K] validity mask for future horizon
+        max_agents: number of agents to select
+        
+    Returns:
+        indices [A] of agents sorted by presence duration (descending)
+    """
+    counts = gt_mask.sum(0)  # [K] - how many timesteps each agent is present
     idx = torch.argsort(counts, descending=True)
     return idx[:max_agents]
 
@@ -347,7 +366,13 @@ def main():
     parser.add_argument("--max_agents", type=int, default=10, help="Max agents to draw per sample.")
     parser.add_argument("--sampling", type=str, default="random", choices=["random", "uniform"])
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--select_agents", type=str, default="error", choices=["error", "presence"])
+    parser.add_argument(
+        "--select_agents", 
+        type=str, 
+        default="error", 
+        choices=["error", "presence"],
+        help="Agent selection mode: 'error'=highest ADE (show failures), 'presence'=longest duration (show complete trajectories)"
+    )
     parser.add_argument("--zoom_margin_px", type=int, default=60)
     parser.add_argument("--arrows_every", type=int, default=0, help="Draw direction arrows every N steps (0 disables).")
     parser.add_argument("--site_id_feat", type=int, default=11)
@@ -374,10 +399,16 @@ def main():
     with open(args.metadata, "r") as f:
         metadata = json.load(f)
 
-    continuous_indices = [0, 1, 2, 3, 4, 5, 6, 9, 10]
     vi = metadata.get("validation_info", {})
     df = vi.get("discrete_features", {"class_id": 7, "lane_id": 8, "site_id": 11})
     discrete_indices = [int(df["class_id"]), int(df["lane_id"]), int(df["site_id"])]
+    
+    # Compute continuous indices from metadata
+    n_features = int(metadata.get("n_features", 12))
+    angle_idx = int(vi.get("angle_idx", 6))
+    all_indices = set(range(n_features))
+    skip_indices = set(discrete_indices + [angle_idx])
+    continuous_indices = sorted(list(all_indices - skip_indices))
 
     print(f"Continuous features: {continuous_indices}")
     print(f"Discrete features: {discrete_indices}")

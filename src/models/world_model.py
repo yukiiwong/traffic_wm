@@ -361,7 +361,7 @@ class WorldModel(nn.Module):
 
         for step in range(n_steps):
             # Decode latent - outputs CONTINUOUS features only
-            base_states_cont, exist_logits, residual_xy = self.decoder(current_latent, return_residual_xy=True)
+            base_states_cont, exist_logits, residual_xy, _ = self.decoder(current_latent, return_residual_xy=True)
             # base_states_cont: [B,1,K,F_cont=9], residual_xy: [B,1,K,2]
             pred_state_cont = base_states_cont.clone()
 

@@ -57,7 +57,14 @@
     "9": "has_preceding",
     "10": "has_following",
     "11": "site_id",
-    "20": "velocity_direction"
+    "12": "rel_x_preceding",
+    "13": "rel_y_preceding",
+    "14": "rel_vx_preceding",
+    "15": "rel_vy_preceding",
+    "16": "rel_x_following",
+    "17": "rel_y_following",
+    "18": "rel_vx_following",
+    "19": "rel_vy_following"
   },
   "validation_info": {
     "num_lanes": 20,
@@ -75,20 +82,14 @@
       "angle"
     ],
     "context_length": 65,
-    "rollout_horizon": 15
-  },
-  "num_features": 21,
-  "feature_descriptions": {
-    "velocity_direction": {
-      "index": 20,
-      "description": "Direction of velocity vector in radians",
-      "formula": "atan2(vy, vx)",
-      "range": "[-\u03c0, \u03c0]",
-      "normalization": "angle / \u03c0 \u2192 [-1, 1]",
-      "computed_from": [
-        "vx (feature 2)",
-        "vy (feature 3)"
-      ]
-    }
+    "rollout_horizon": 15,
+    "exclude_features": [
+      9,
+      10
+    ],
+    "exclude_feature_names": [
+      "sin_angle",
+      "cos_angle"
+    ]
   }
 }

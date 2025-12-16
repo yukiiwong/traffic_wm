@@ -257,10 +257,17 @@ def main():
         metadata = json.load(f)
 
     # indices must match your training pipeline
-    continuous_indices = [0, 1, 2, 3, 4, 5, 6, 9, 10]
     from src.utils.common import parse_discrete_feature_indices_from_metadata
     lane_idx, class_idx, site_idx = parse_discrete_feature_indices_from_metadata(metadata, fallback=(8, 7, 11), strict=False)
     discrete_indices = [class_idx, lane_idx, site_idx]
+    
+    # Compute continuous indices from metadata
+    vi = metadata.get("validation_info", {})
+    n_features = int(metadata.get("n_features", 12))
+    angle_idx = int(vi.get("angle_idx", 6))
+    all_indices = set(range(n_features))
+    skip_indices = set(discrete_indices + [angle_idx])
+    continuous_indices = sorted(list(all_indices - skip_indices))
 
     ckpt = torch.load(args.checkpoint, map_location=device)
     state_dict = ckpt["model_state_dict"]

@@ -23,20 +23,24 @@ class WorldModelLoss(nn.Module):
         pred_weight: float = 1.0,
         exist_weight: float = 0.1,
         angle_weight: float = 0.5,  # Weight for angle loss (angular distance)
+        velocity_direction_weight: float = 0.3,  # Weight for velocity direction loss
         huber_beta: float = 1.0,
         continuous_indices: Optional[List[int]] = None,
         angle_idx: Optional[int] = None,  # Index of angle in full state (default 6)
         use_pred_existence_loss: bool = True,
+        velocity_threshold: float = 0.5,  # m/s threshold for moving vehicles
     ):
         super().__init__()
         self.recon_weight = float(recon_weight)
         self.pred_weight = float(pred_weight)
         self.exist_weight = float(exist_weight)
         self.angle_weight = float(angle_weight)
+        self.velocity_direction_weight = float(velocity_direction_weight)
         self.huber_beta = float(huber_beta)
         self.continuous_indices = continuous_indices
         self.angle_idx = angle_idx if angle_idx is not None else 6  # Default angle at index 6
         self.use_pred_existence_loss = bool(use_pred_existence_loss)
+        self.velocity_threshold = float(velocity_threshold)
 
         self.bce_logits = nn.BCEWithLogitsLoss(reduction="none")
 
@@ -101,6 +105,51 @@ class WorldModelLoss(nn.Module):
         masked = angular_dist * mask
         return (masked.sum() / mask.sum().clamp(min=1.0))
 
+    def _velocity_direction_loss(
+        self,
+        pred_vel: torch.Tensor,
+        target_vel: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute velocity direction loss for moving vehicles.
+        
+        This directly supervises the DIRECTION of velocity prediction,
+        which is what appears as arrows in visualization and is measured
+        by velocity_direction_error metric.
+        
+        Args:
+            pred_vel: [B, T, K, 2] predicted velocity (vx, vy) in continuous feature order
+            target_vel: [B, T, K, 2] target velocity (vx, vy) from full state
+            mask: [B, T, K] validity mask
+        
+        Returns:
+            scalar loss (angular error in radians)
+        """
+        # Filter to moving vehicles only (avoid noise from stationary vehicles)
+        target_speed = torch.norm(target_vel, dim=-1)  # [B, T, K]
+        moving_mask = mask * (target_speed > self.velocity_threshold).float()
+        
+        if moving_mask.sum() < 1:
+            return torch.tensor(0.0, device=pred_vel.device)
+        
+        # Compute velocity directions (angles)
+        pred_dir = torch.atan2(pred_vel[..., 1], pred_vel[..., 0])  # [B, T, K]
+        target_dir = torch.atan2(target_vel[..., 1], target_vel[..., 0])  # [B, T, K]
+        
+        # Compute angular difference (periodic, in [0, pi])
+        dir_diff = torch.abs(
+            torch.atan2(
+                torch.sin(pred_dir - target_dir),
+                torch.cos(pred_dir - target_dir)
+            )
+        )  # [B, T, K]
+        
+        # Average over moving vehicles
+        masked_diff = dir_diff * moving_mask
+        return masked_diff.sum() / moving_mask.sum()
+
+
     def forward(self, predictions: Dict[str, torch.Tensor], targets: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         targets must include:
@@ -152,11 +201,42 @@ class WorldModelLoss(nn.Module):
             # Prediction angle loss (one-step ahead)
             pred_angle_loss = self._angular_loss(pred_angle[:, :-1], gt_angle[:, 1:], masks[:, :-1])
 
+        # Velocity direction losses (supervise motion direction for moving vehicles)
+        recon_vel_dir_loss = torch.tensor(0.0, device=states.device)
+        pred_vel_dir_loss = torch.tensor(0.0, device=states.device)
+        
+        if self.continuous_indices is not None and 2 in self.continuous_indices and 3 in self.continuous_indices:
+            # Find vx, vy in continuous features
+            try:
+                vx_idx_cont = self.continuous_indices.index(2)
+                vy_idx_cont = self.continuous_indices.index(3)
+                
+                # Extract predicted velocities (already in continuous order)
+                recon_vel = recon_states[..., [vx_idx_cont, vy_idx_cont]]  # [B,T,K,2]
+                pred_vel = pred_states[..., [vx_idx_cont, vy_idx_cont]]    # [B,T,K,2]
+                
+                # Extract GT velocities from full states (features 2,3)
+                gt_vel = states[..., [2, 3]]  # [B,T,K,2]
+                
+                # Reconstruction velocity direction loss
+                recon_vel_dir_loss = self._velocity_direction_loss(recon_vel, gt_vel, masks)
+                
+                # Prediction velocity direction loss (one-step ahead)
+                pred_vel_dir_loss = self._velocity_direction_loss(
+                    pred_vel[:, :-1], 
+                    gt_vel[:, 1:], 
+                    masks[:, :-1]
+                )
+            except (ValueError, IndexError):
+                # vx or vy not in continuous_indices, skip velocity direction loss
+                pass
+
         total = (
             self.recon_weight * recon_loss
             + self.pred_weight * pred_loss
             + self.exist_weight * (exist_loss + pred_exist_loss)
             + self.angle_weight * (recon_angle_loss + pred_angle_loss)
+            + self.velocity_direction_weight * (recon_vel_dir_loss + pred_vel_dir_loss)
         )
 
         return {
@@ -167,4 +247,6 @@ class WorldModelLoss(nn.Module):
             "pred_exist_loss": pred_exist_loss.detach(),
             "recon_angle_loss": recon_angle_loss.detach(),
             "pred_angle_loss": pred_angle_loss.detach(),
+            "recon_vel_dir_loss": recon_vel_dir_loss.detach(),
+            "pred_vel_dir_loss": pred_vel_dir_loss.detach(),
         }

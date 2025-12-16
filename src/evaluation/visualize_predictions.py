@@ -297,10 +297,16 @@ def main():
         metadata = json.load(f)
 
     # indices
-    continuous_indices = [0, 1, 2, 3, 4, 5, 6, 9, 10]
     vi = metadata.get("validation_info", {})
     df = vi.get("discrete_features", {"class_id": 7, "lane_id": 8, "site_id": 11})
     discrete_indices = [int(df["class_id"]), int(df["lane_id"]), int(df["site_id"])]
+    
+    # Compute continuous indices from metadata
+    n_features = int(metadata.get("n_features", 12))
+    angle_idx = int(vi.get("angle_idx", 6))
+    all_indices = set(range(n_features))
+    skip_indices = set(discrete_indices + [angle_idx])
+    continuous_indices = sorted(list(all_indices - skip_indices))
 
     print(f"Continuous features: {continuous_indices}")
     print(f"Discrete features: {discrete_indices}")

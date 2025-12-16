@@ -13,23 +13,31 @@
 
 ---
 
-## 🆕 最新更新 (v2.4)
+## 🆕 最新更新 (v2.5)
 
-### 新增功能
+### 简化特征配置 + 速度方向监督
 
-1. **相对位置特征** ⭐
-   - 新增 8 个相对特征：前车/后车的相对位置和速度
-   - 提升车辆交互场景的预测准确度
-   - 特征总数：12 → 20
+1. **简化特征集** ⭐
+   - 特征总数：24 (20原始 + 4派生)
+   - Continuous特征：15个 (去除后车信息)
+   - 保留：基本运动(6) + 前车交互(5) + 派生特征(4)
 
-2. **训练优化**
-   - 添加 Learning Rate Scheduler (Cosine/Step/Plateau)
-   - 可调节的 angle_weight 参数
-   - 修复 angle 归一化问题（添加 angle_idx 到 metadata）
+2. **派生交互特征** 🔥
+   - velocity_direction: atan2(vy, vx) - 速度方向角
+   - headway: 纵向车距
+   - ttc: Time-To-Collision 碰撞时间
+   - preceding_distance: 前车总距离
 
-3. **二值特征改进**
-   - 对 has_preceding/has_following 应用 sigmoid 激活
-   - 更准确的二值特征预测
+3. **速度方向损失** 🎯
+   - velocity_direction_loss (weight=0.3)
+   - 约束速度和方向一致性
+   - 预期改进：velocity_direction_error 60° → 20-30°
+
+4. **评估指标扩展**
+   - moving_ade: 只计算运动车辆的ADE
+   - velocity_direction_error: 速度方向误差
+   - acceleration_error: 加速度预测误差
+   - position_variance: 位置方差（轨迹平滑度）
 
 ---
 
@@ -50,46 +58,46 @@
 
 ## 🎯 特征说明
 
-### 基础特征模式（12 维）
+### 简化特征配置 (v2.5) ⭐ 当前使用
 
+**特征总数**: 24 (20原始 + 4派生)  
+**Continuous特征**: 15个
+
+#### 基本运动 (6个)
 ```
-0:  center_x       - 车辆中心 x 坐标
-1:  center_y       - 车辆中心 y 坐标
-2:  vx             - x 方向速度
-3:  vy             - y 方向速度
-4:  ax             - x 方向加速度
-5:  ay             - y 方向加速度
-6:  angle          - 朝向角（弧度，不归一化）
-7:  class_id       - 车辆类别（离散）
-8:  lane_id        - 车道ID（离散）
-9:  has_preceding  - 是否有前车（二值）
-10: has_following  - 是否有后车（二值）
-11: site_id        - 站点ID（离散）
+[0-5]: center_x, center_y, vx, vy, ax, ay
 ```
 
-**连续特征数**: 8 (0-6 共7个 + has_preceding + has_following，去除3个离散特征: class_id, lane_id, site_id)
-
-### 增强特征模式（20 维）⭐ 推荐
-
-在基础特征基础上添加：
-
+#### 前车交互 - 原始特征 (5个)
 ```
-12: preceding_rel_x   - 前车相对 x 距离
-13: preceding_rel_y   - 前车相对 y 距离
-14: preceding_rel_vx  - 前车相对 x 速度
-15: preceding_rel_vy  - 前车相对 y 速度
-16: following_rel_x   - 后车相对 x 距离
-17: following_rel_y   - 后车相对 y 距离
-18: following_rel_vx  - 后车相对 x 速度
-19: following_rel_vy  - 后车相对 y 速度
+[9]:  has_preceding      - 是否有前车 (0/1)
+[12]: rel_x_preceding    - 前车相对x位置
+[13]: rel_y_preceding    - 前车相对y位置
+[14]: rel_vx_preceding   - 前车相对x速度
+[15]: rel_vy_preceding   - 前车相对y速度
 ```
 
-**连续特征数**: 16
+#### 派生交互特征 (4个) - 动态计算
+```
+[20]: velocity_direction  - 速度方向角 = atan2(vy, vx)
+[21]: headway            - 纵向车距 = rel_x_preceding
+[22]: ttc                - Time-To-Collision = -distance/rel_vx
+[23]: preceding_distance - 总距离 = sqrt(rel_x² + rel_y²)
+```
+
+#### 排除的特征
+```
+[6]:     angle           - 车辆朝向角 (与速度方向可能不一致)
+[7,8,11]: discrete       - class_id, lane_id, site_id
+[10]:    has_following   - 后车标志
+[16-19]: rel_*_following - 后车相对特征 (不需要)
+```
 
 **优势**:
-- ✅ 直接建模车辆间距和速度差
-- ✅ 改进跟车、变道场景预测
-- ✅ 位置/速度 MAE 预期降低 10-25%
+- ✅ 更简洁：15个特征 vs 原来17个
+- ✅ 更聚焦：只关注前车交互
+- ✅ 更直观：headway/ttc直接对应驾驶行为
+- ✅ 速度方向一致性：velocity_direction显式监督
 
 ---
 
@@ -439,6 +447,29 @@ python src/data/validate_preprocessing.py
 
 ## 🎓 模型训练
 
+### 当前推荐训练方式 (v2.5) ⭐
+
+使用简化特征配置 + velocity_direction_loss：
+
+```bash
+./train_with_interaction_and_vel_dir.sh
+```
+
+**训练配置**:
+- 特征数: 24 (15个continuous)
+- Batch size: 32
+- Learning rate: 1e-4
+- Epochs: 200
+- Loss weights:
+  - reconstruction: 1.0
+  - prediction: 1.0
+  - velocity_direction: 0.3
+
+**Loss函数**:
+- `reconstruction_loss`: MSE重建损失
+- `prediction_loss`: MSE预测损失
+- `velocity_direction_loss`: 速度方向角损失 (新增)
+
 ### 步骤1: 训练前准备
 
 **使用的代码文件**:
@@ -452,42 +483,38 @@ python src/data/validate_preprocessing.py
 
 **检查元数据**:
 ```bash
-cat data/processed/metadata.json | grep n_features
-# 输出: "n_features": 12
+cat data/processed_siteA_20/metadata.json | grep num_features
+# 输出: "num_features": 20 (原始特征)
+# 动态添加: 4个派生特征 (velocity_direction, headway, ttc, preceding_distance)
 ```
 
-### 步骤2: 训练命令
+### 步骤2: 手动训练命令（高级用法）
 
-**多站点训练（默认）**:
+**推荐配置 (简化特征)**:
 ```bash
 python src/training/train_world_model.py \
-    --train_data data/processed/train_episodes.npz \
-    --val_data data/processed/val_episodes.npz \
-    --checkpoint_dir checkpoints/world_model \
-    --input_dim 12 \
-    --continuous_dim 9 \
-    --latent_dim 256 \
-    --batch_size 16 \
-    --epochs 50 \
-    --lr 3e-4 \
-    --weight_decay 1e-4 \
-    --grad_clip 1.0
+    --train_data data/processed_siteA_20/train_episodes.npz \
+    --val_data data/processed_siteA_20/val_episodes.npz \
+    --log_dir experiments/simplified_vel_dir \
+    --epochs 200 \
+    --batch_size 32 \
+    --learning_rate 1e-4 \
+    --latent_dim 512 \
+    --dynamics_layers 6 \
+    --num_heads 16 \
+    --recon_weight 1.0 \
+    --pred_weight 1.0 \
+    --velocity_direction_weight 0.3 \
+    --velocity_threshold 0.5 \
+    --eval_interval 10 \
+    --save_interval 20
 ```
 
-**单站点训练（例如只训练Site A）**:
+**旧版配置 (完整特征) - 不推荐**:
 ```bash
-# 1. 预处理单站点数据
-python src/data/preprocess_multisite.py \
-    --raw_data_dir data/raw \
-    --output_dir data/processed_siteA \
-    --sites A \
-    --episode_length 80 \
-    --stride 15
-
-# 2. 训练单站点模型
 python src/training/train_world_model.py \
-    --train_data data/processed_siteA/train_episodes.npz \
-    --val_data data/processed_siteA/val_episodes.npz \
+    --train_data data/processed_siteA_20/train_episodes.npz \
+    --val_data data/processed_siteA_20/val_episodes.npz \
     --checkpoint_dir checkpoints/world_model_siteA \
     --input_dim 12 \
     --continuous_dim 9 \

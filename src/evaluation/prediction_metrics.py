@@ -89,7 +89,7 @@ def compute_heading_error(
     predicted: torch.Tensor,
     ground_truth: torch.Tensor,
     masks: torch.Tensor,
-    heading_idx: int,
+    heading_idx: Optional[int],
     assume_radians: bool = True,
 ) -> float:
     """
@@ -98,13 +98,17 @@ def compute_heading_error(
     Args:
         heading_idx: which feature dimension corresponds to heading/angle.
                     (For your metadata: angle is feature 6.)
+                    If None, returns float('nan') to indicate unavailable.
         assume_radians: if True, converts result to degrees for readability.
 
     Returns:
         mean heading error in degrees (default) or radians (if assume_radians=False)
+        Returns NaN if heading_idx is None or out of range.
     """
+    if heading_idx is None:
+        return float('nan')
     if predicted.shape[-1] <= heading_idx or ground_truth.shape[-1] <= heading_idx:
-        return 0.0
+        return float('nan')
 
     pred_h = predicted[..., heading_idx]
     gt_h = ground_truth[..., heading_idx]
@@ -308,6 +312,220 @@ def compute_all_metrics(
             }
         )
 
+    return metrics
+
+
+def compute_moving_agent_metrics(
+    predicted: torch.Tensor,
+    ground_truth: torch.Tensor,
+    masks: torch.Tensor,
+    velocity_threshold: float = 0.5,  # m/s or px/s depending on conversion
+) -> Dict[str, float]:
+    """
+    Compute metrics only for moving agents (velocity > threshold).
+    
+    Useful for traffic scenarios with many stationary vehicles (at traffic lights, etc.)
+    
+    Args:
+        velocity_threshold: minimum velocity magnitude to consider agent as "moving"
+                           Should be in same units as velocity features (m/s if converted)
+    
+    Returns:
+        Dict with moving_ade, moving_fde, moving_velocity_error, moving_agent_ratio
+    """
+    if predicted.shape[-1] < 4 or ground_truth.shape[-1] < 4:
+        return {
+            "moving_ade": float('nan'),
+            "moving_fde": float('nan'), 
+            "moving_velocity_error": float('nan'),
+            "moving_agent_ratio": 0.0,
+        }
+    
+    # Compute velocity magnitude from ground truth
+    gt_vel = ground_truth[..., 2:4]  # [B,T,K,2]
+    vel_mag = torch.norm(gt_vel, dim=-1)  # [B,T,K]
+    
+    # Moving mask: valid AND velocity > threshold
+    moving_mask = masks * (vel_mag > velocity_threshold).float()
+    
+    moving_count = moving_mask.sum()
+    total_count = masks.sum()
+    
+    if moving_count < 1:
+        return {
+            "moving_ade": float('nan'),
+            "moving_fde": float('nan'),
+            "moving_velocity_error": float('nan'),
+            "moving_agent_ratio": 0.0,
+        }
+    
+    # ADE for moving agents
+    pred_pos = predicted[..., :2]
+    gt_pos = ground_truth[..., :2]
+    displacement = torch.norm(pred_pos - gt_pos, dim=-1)
+    moving_ade = (displacement * moving_mask).sum() / moving_count
+    
+    # FDE for moving agents (last timestep)
+    moving_mask_final = moving_mask[:, -1, :]
+    if moving_mask_final.sum() > 0:
+        displacement_final = torch.norm(predicted[:, -1, :, :2] - ground_truth[:, -1, :, :2], dim=-1)
+        moving_fde = (displacement_final * moving_mask_final).sum() / moving_mask_final.sum()
+    else:
+        moving_fde = torch.tensor(float('nan'))
+    
+    # Velocity error for moving agents
+    pred_vel = predicted[..., 2:4]
+    vel_error = torch.norm(pred_vel - gt_vel, dim=-1)
+    moving_vel_error = (vel_error * moving_mask).sum() / moving_count
+    
+    return {
+        "moving_ade": moving_ade.item(),
+        "moving_fde": moving_fde.item(),
+        "moving_velocity_error": moving_vel_error.item(),
+        "moving_agent_ratio": (moving_count / total_count).item() if total_count > 0 else 0.0,
+    }
+
+
+def compute_velocity_direction_error(
+    predicted: torch.Tensor,
+    ground_truth: torch.Tensor,
+    masks: torch.Tensor,
+    velocity_threshold: float = 0.5,
+) -> float:
+    """
+    Compute angular difference between predicted and GT velocity directions.
+    
+    This measures if the predicted motion direction is correct, which is often
+    more important than exact heading angle for trajectory prediction.
+    
+    Args:
+        velocity_threshold: only compute for agents with velocity > threshold
+    
+    Returns:
+        Mean angular error in degrees
+    """
+    if predicted.shape[-1] < 4 or ground_truth.shape[-1] < 4:
+        return float('nan')
+    
+    pred_vel = predicted[..., 2:4]  # [B,T,K,2]
+    gt_vel = ground_truth[..., 2:4]
+    
+    # Filter by velocity threshold
+    gt_vel_mag = torch.norm(gt_vel, dim=-1)
+    moving_mask = masks * (gt_vel_mag > velocity_threshold).float()
+    
+    if moving_mask.sum() < 1:
+        return float('nan')
+    
+    # Compute angles from velocities
+    pred_angle = torch.atan2(pred_vel[..., 1], pred_vel[..., 0])  # [B,T,K]
+    gt_angle = torch.atan2(gt_vel[..., 1], gt_vel[..., 0])
+    
+    # Angular difference
+    angle_diff = _angular_diff_rad(pred_angle, gt_angle)  # [B,T,K] in radians
+    
+    # Average over moving agents
+    masked_diff = angle_diff * moving_mask
+    mean_error_rad = masked_diff.sum() / moving_mask.sum()
+    
+    return (mean_error_rad * 180.0 / math.pi).item()
+
+
+def compute_acceleration_error(
+    predicted: torch.Tensor,
+    ground_truth: torch.Tensor,
+    masks: torch.Tensor,
+) -> float:
+    """
+    Mean L2 acceleration error over all valid agents.
+    
+    Returns:
+        acceleration error (m/s^2 if converted)
+    """
+    if predicted.shape[-1] < 6 or ground_truth.shape[-1] < 6:
+        return float('nan')
+    
+    pred_acc = predicted[..., 4:6]
+    gt_acc = ground_truth[..., 4:6]
+    acc_error = torch.norm(pred_acc - gt_acc, dim=-1)
+    masked = acc_error * masks
+    return (masked.sum() / masks.sum().clamp(min=1)).item()
+
+
+def compute_position_variance(
+    predicted: torch.Tensor,
+    masks: torch.Tensor,
+) -> Dict[str, float]:
+    """
+    Compute variance of predicted positions to detect mode collapse.
+    
+    Low variance suggests the model is not capturing trajectory diversity.
+    
+    Returns:
+        Dict with pos_variance_x, pos_variance_y, pos_variance_total
+    """
+    pred_pos = predicted[..., :2]  # [B,T,K,2]
+    
+    # Only compute over valid agents
+    valid_count = masks.sum()
+    if valid_count < 2:
+        return {
+            "pos_variance_x": float('nan'),
+            "pos_variance_y": float('nan'),
+            "pos_variance_total": float('nan'),
+        }
+    
+    # Flatten to [N, 2] where N = valid agents
+    valid_pos = pred_pos[masks > 0.5]  # [N, 2]
+    
+    var_x = valid_pos[:, 0].var().item()
+    var_y = valid_pos[:, 1].var().item()
+    var_total = var_x + var_y
+    
+    return {
+        "pos_variance_x": var_x,
+        "pos_variance_y": var_y,
+        "pos_variance_total": var_total,
+    }
+
+
+def compute_extended_metrics(
+    predicted: torch.Tensor,
+    ground_truth: torch.Tensor,
+    masks: torch.Tensor,
+    velocity_threshold: float = 0.5,
+) -> Dict[str, float]:
+    """
+    Compute extended metrics including moving-agent-specific and direction metrics.
+    
+    Args:
+        velocity_threshold: m/s threshold for considering an agent as "moving"
+    
+    Returns:
+        Dict with all extended metrics
+    """
+    metrics = {}
+    
+    # Moving agent metrics
+    moving_metrics = compute_moving_agent_metrics(
+        predicted, ground_truth, masks, velocity_threshold
+    )
+    metrics.update(moving_metrics)
+    
+    # Velocity direction error
+    metrics["velocity_direction_error"] = compute_velocity_direction_error(
+        predicted, ground_truth, masks, velocity_threshold
+    )
+    
+    # Acceleration error
+    metrics["acceleration_error"] = compute_acceleration_error(
+        predicted, ground_truth, masks
+    )
+    
+    # Position variance (mode collapse detection)
+    variance_metrics = compute_position_variance(predicted, masks)
+    metrics.update(variance_metrics)
+    
     return metrics
 
 

@@ -110,15 +110,35 @@ class TrajectoryDataset(Dataset):
                 non_normalized_indices = [v for v in discrete_features.values() if v is not None]
                 if angle_idx is not None:
                     non_normalized_indices.append(angle_idx)
+                
+                # Get explicitly excluded features (e.g., sin_angle, cos_angle)
+                exclude_features = validation_info.get('exclude_features', [])
+                if exclude_features:
+                    print(f"Excluding features from continuous_indices: {exclude_features}")
+                    exclude_names = validation_info.get('exclude_feature_names', [])
+                    if exclude_names:
+                        print(f"  Feature names: {exclude_names}")
+                    non_normalized_indices.extend(exclude_features)
 
                 if discrete_features:
                     # ✅ FIX: Filter out None values before sorting
                     discrete_values = [v for v in discrete_features.values() if v is not None]
                     self.discrete_indices = sorted(set(discrete_values))
-                    # Continuous features: exclude discrete AND angle
+                    # Continuous features: exclude discrete, angle, AND explicitly excluded features
                     self.continuous_indices = [i for i in range(self.F)
                                                 if i not in non_normalized_indices]
+                    
+                    # Exclude following vehicle features: has_following (10) and rel_*_following (16-19)
+                    following_features = [10, 16, 17, 18, 19]
+                    self.continuous_indices = [i for i in self.continuous_indices 
+                                                if i not in following_features]
+                    
+                    # Add derived features: velocity_direction (20), headway (21), ttc (22), preceding_distance (23)
+                    self.continuous_indices.extend([20, 21, 22, 23])
+                    
                     print(f"Loaded discrete feature indices from metadata: {self.discrete_indices}")
+                    print(f"Excluded following vehicle features: {following_features}")
+                    print(f"Added derived interaction features: [20:velocity_direction, 21:headway, 22:ttc, 23:preceding_distance]")
                     if angle_idx is not None:
                         print(f"Angle feature at index {angle_idx} will NOT be normalized (periodic)")
                         self.angle_idx = angle_idx
@@ -175,9 +195,43 @@ class TrajectoryDataset(Dataset):
         if len(self.continuous_indices) == 0:
             print("Warning: No continuous features to normalize!")
             return
+        
+        # Compute derived features and append temporarily
+        # Feature 20: velocity_direction
+        vx = self.states[:, :, :, 2]  # [N, T, K]
+        vy = self.states[:, :, :, 3]  # [N, T, K]
+        vel_dir = torch.atan2(vy, vx)  # [N, T, K]
+        
+        # Feature 21: headway (from rel_x_preceding)
+        headway = self.states[:, :, :, 12]  # [N, T, K]
+        
+        # Feature 22: ttc
+        rel_x = self.states[:, :, :, 12]  # [N, T, K]
+        rel_y = self.states[:, :, :, 13]  # [N, T, K]
+        rel_vx = self.states[:, :, :, 14]  # [N, T, K]
+        
+        distance = torch.sqrt(rel_x**2 + rel_y**2)
+        ttc = torch.where(
+            rel_vx < -0.1,
+            -distance / rel_vx,
+            torch.tensor(100.0)  # Use finite value for stats
+        )
+        ttc = torch.clamp(ttc / 30.0, 0, 100)  # Convert to seconds
+        
+        # Feature 23: preceding_distance
+        preceding_distance = distance
+        
+        # Append all derived features [20, 21, 22, 23]
+        states_with_derived = torch.cat([
+            self.states,
+            vel_dir.unsqueeze(-1),
+            headway.unsqueeze(-1),
+            ttc.unsqueeze(-1),
+            preceding_distance.unsqueeze(-1)
+        ], dim=-1)  # [N, T, K, 24]
 
         # Extract continuous features only
-        continuous_states = self.states[..., self.continuous_indices]  # [N, T, K, n_continuous]
+        continuous_states = states_with_derived[..., self.continuous_indices]  # [N, T, K, n_continuous]
 
         # Compute statistics only on valid entries
         valid_continuous = continuous_states * valid_mask[..., :len(self.continuous_indices)]
@@ -226,22 +280,36 @@ class TrajectoryDataset(Dataset):
         if len(self.continuous_indices) == 0:
             print("No continuous features to normalize, skipping normalization")
             return
+        
+        # Filter continuous_indices to only include features that exist in self.states
+        # Feature 20 (velocity_direction) is added dynamically in __getitem__
+        existing_continuous = [i for i in self.continuous_indices if i < self.F]
+        
+        if len(existing_continuous) == 0:
+            print("No existing continuous features to normalize")
+            return
 
-        # Extract continuous features
-        continuous_feats = self.states[..., self.continuous_indices]  # [N, T, K, n_continuous]
+        # Extract continuous features (exclude velocity_direction for now)
+        continuous_feats = self.states[..., existing_continuous]  # [N, T, K, n_continuous-1]
+
+        # Get corresponding mean and std (exclude velocity_direction stats)
+        mean_existing = self.mean[:len(existing_continuous)]
+        std_existing = self.std[:len(existing_continuous)]
 
         # Normalize
-        continuous_feats = (continuous_feats - self.mean) / self.std
+        continuous_feats = (continuous_feats - mean_existing) / std_existing
 
         # Apply mask to ensure padding remains zero
         continuous_feats = continuous_feats * self.masks.unsqueeze(-1)
 
         # Put normalized features back into states
-        self.states[..., self.continuous_indices] = continuous_feats
+        self.states[..., existing_continuous] = continuous_feats
 
         # Discrete features (if any) remain unchanged at their original integer values
-        print(f"Normalized {len(self.continuous_indices)} continuous features")
+        # Note: velocity_direction (feature 20) will be computed and normalized in __getitem__
+        print(f"Normalized {len(existing_continuous)} continuous features (excluding velocity_direction)")
         print(f"Preserved {len(self.discrete_indices)} discrete features without normalization")
+        print(f"velocity_direction (feature 20) will be computed dynamically in __getitem__")
 
     def _validate_and_clamp_discrete_features(self) -> None:
         """
@@ -307,15 +375,77 @@ class TrajectoryDataset(Dataset):
 
         Returns:
             Dictionary with:
-                - states: [T, K, F] (float32, normalized continuous + raw discrete)
+                - states: [T, K, F+1] (float32, normalized continuous + raw discrete + velocity_direction)
                 - masks: [T, K] (float32)
                 - scene_id: scalar (int64) - site identifier (0=A, 1=B, ..., 8=I)
                 - site_id: scalar (int64) - alias for scene_id, used as episode-level conditioning
                 - discrete_features: [T, K, n_discrete] (int64, ready for embeddings)
         """
-        states = self.states[idx]  # [T, K, F]
+        states = self.states[idx]  # [T, K, F=20]
         masks = self.masks[idx]    # [T, K]
         site_id = self.scene_ids[idx]  # scalar site identifier
+        
+        # === Dynamically add derived features ===
+        
+        # Feature 20: velocity_direction (from vx=2, vy=3)
+        vx = states[:, :, 2]  # [T, K]
+        vy = states[:, :, 3]  # [T, K]
+        vel_dir = torch.atan2(vy, vx)  # [T, K] in radians [-π, π]
+        
+        # Feature 21: headway (longitudinal distance to preceding vehicle)
+        # From rel_x_preceding (feature 12)
+        headway = states[:, :, 12]  # [T, K] in pixels
+        
+        # Feature 22: ttc (Time-To-Collision with preceding vehicle)
+        # Computed from relative position and velocity
+        rel_x = states[:, :, 12]  # [T, K]
+        rel_y = states[:, :, 13]  # [T, K]
+        rel_vx = states[:, :, 14]  # [T, K]
+        rel_vy = states[:, :, 15]  # [T, K]
+        
+        distance = torch.sqrt(rel_x**2 + rel_y**2)  # [T, K]
+        rel_speed = torch.sqrt(rel_vx**2 + rel_vy**2)  # [T, K]
+        
+        # TTC = -distance / relative_velocity (only if approaching)
+        # Negative rel_vx means closing in
+        ttc = torch.where(
+            rel_vx < -0.1,  # Approaching (threshold 0.1 px/s)
+            -distance / rel_vx,
+            torch.tensor(float('inf'))  # Not approaching
+        )
+        # Clamp to reasonable range [0, 100] seconds
+        # Convert from pixels/frame to seconds: multiply by frame_time
+        # Assuming 30 FPS: 1 frame = 1/30 sec
+        ttc = torch.clamp(ttc / 30.0, 0, 100)  # [T, K] in seconds
+        
+        # Feature 23: preceding_distance (total distance)
+        preceding_distance = distance  # [T, K] in pixels
+        
+        # Normalize derived features
+        if hasattr(self, 'mean') and hasattr(self, 'std'):
+            # velocity_direction: use stats at index -4
+            vel_dir_normalized = (vel_dir - self.mean[-4]) / self.std[-4]
+            # headway: use stats at index -3
+            headway_normalized = (headway - self.mean[-3]) / self.std[-3]
+            # ttc: use stats at index -2
+            ttc_normalized = (ttc - self.mean[-2]) / self.std[-2]
+            # preceding_distance: use stats at index -1
+            distance_normalized = (preceding_distance - self.mean[-1]) / self.std[-1]
+        else:
+            # Fallback normalization
+            vel_dir_normalized = vel_dir / np.pi
+            headway_normalized = headway / 100.0  # rough normalization
+            ttc_normalized = ttc / 10.0
+            distance_normalized = preceding_distance / 100.0
+        
+        # Concatenate all derived features [20, 21, 22, 23]
+        states = torch.cat([
+            states,
+            vel_dir_normalized.unsqueeze(-1),
+            headway_normalized.unsqueeze(-1),
+            ttc_normalized.unsqueeze(-1),
+            distance_normalized.unsqueeze(-1)
+        ], dim=-1)  # [T, K, 24]
 
         # ✅ FIX: Extract discrete features as separate LongTensor for embeddings
         if len(self.discrete_indices) > 0:

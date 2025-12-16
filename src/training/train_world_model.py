@@ -51,6 +51,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pred_weight", type=float, default=1.0)
     p.add_argument("--existence_weight", type=float, default=0.1)
     p.add_argument("--angle_weight", type=float, default=0.5, help="Weight for angle loss")
+    p.add_argument("--velocity_direction_weight", type=float, default=0.3, 
+                   help="Weight for velocity direction loss (supervises motion direction)")
+    p.add_argument("--velocity_threshold", type=float, default=0.5,
+                   help="Velocity threshold (m/s) for moving vehicle detection in direction loss")
 
     # logging
     p.add_argument("--log_dir", type=str, default="logs/world_model")
@@ -303,7 +307,15 @@ def evaluate(
         Dictionary with loss metrics and optional diagnostics
     """
     model.eval()
-    totals = {"total_loss": 0.0, "recon_loss": 0.0, "pred_loss": 0.0, "exist_loss": 0.0, "pred_exist_loss": 0.0}
+    totals = {
+        "total_loss": 0.0, 
+        "recon_loss": 0.0, 
+        "pred_loss": 0.0, 
+        "exist_loss": 0.0, 
+        "pred_exist_loss": 0.0,
+        "recon_vel_dir_loss": 0.0,
+        "pred_vel_dir_loss": 0.0,
+    }
     n = 0
 
     # Diagnostic accumulators
@@ -479,10 +491,18 @@ def main() -> None:
         pred_weight=args.pred_weight,
         exist_weight=args.existence_weight,
         angle_weight=args.angle_weight,
+        velocity_direction_weight=args.velocity_direction_weight,
         huber_beta=1.0,
         continuous_indices=train_loader.dataset.continuous_indices,
         angle_idx=angle_idx,
         use_pred_existence_loss=True,
+        velocity_threshold=args.velocity_threshold,
+    )
+    
+    logger.info(
+        f"Loss weights: recon={args.recon_weight}, pred={args.pred_weight}, "
+        f"exist={args.existence_weight}, angle={args.angle_weight}, "
+        f"vel_dir={args.velocity_direction_weight} (threshold={args.velocity_threshold}m/s)"
     )
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

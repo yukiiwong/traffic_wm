@@ -22,7 +22,7 @@ import torch.nn as nn
 from typing import Dict, List, Optional, Tuple
 from tqdm import tqdm
 
-from src.evaluation.prediction_metrics import compute_all_metrics
+from src.evaluation.prediction_metrics import compute_all_metrics, compute_extended_metrics
 from src.utils.common import get_pixel_to_meter_conversion
 
 
@@ -200,13 +200,33 @@ def evaluate_rollout(
                 teacher_forcing=False,
             )
 
+            # Determine correct heading_idx
+            # angle is feature 6, check if it's in continuous_indices
+            angle_feature_idx = 6
+            heading_idx = None
+            if angle_feature_idx in continuous_indices:
+                heading_idx = continuous_indices.index(angle_feature_idx)
+            
             metrics = compute_all_metrics(
                 predicted=pred_cont,
                 ground_truth=target_cont,
                 masks=target_masks,
                 pixel_to_meter=pixel_to_meter,
                 convert_to_meters=convert_to_meters,
+                heading_idx=heading_idx,
             )
+            
+            # Add extended metrics (moving agents, velocity direction, etc.)
+            # velocity_threshold: 0.5 m/s for moving agents after conversion
+            velocity_threshold = 0.5 if convert_to_meters else 15.0  # ~15 px/s = 0.5 m/s
+            extended = compute_extended_metrics(
+                predicted=pred_cont,
+                ground_truth=target_cont,
+                masks=target_masks,
+                velocity_threshold=velocity_threshold,
+            )
+            metrics.update(extended)
+            
             all_metrics.append(metrics)
 
     return _average_metrics(all_metrics)
@@ -248,6 +268,14 @@ def evaluate_multihorizon(
                 teacher_forcing=False,
             )
 
+            # Determine correct heading_idx once per batch
+            angle_feature_idx = 6
+            heading_idx = None
+            if angle_feature_idx in continuous_indices:
+                heading_idx = continuous_indices.index(angle_feature_idx)
+            
+            velocity_threshold = 0.5 if convert_to_meters else 15.0
+            
             for h in horizons:
                 pred_h = pred_cont_all[:, :h]
                 target_full_h = states_full[:, context_length:context_length + h]
@@ -260,7 +288,17 @@ def evaluate_multihorizon(
                     masks=mask_h,
                     pixel_to_meter=pixel_to_meter,
                     convert_to_meters=convert_to_meters,
+                    heading_idx=heading_idx,
                 )
+                
+                extended = compute_extended_metrics(
+                    predicted=pred_h,
+                    ground_truth=target_cont_h,
+                    masks=mask_h,
+                    velocity_threshold=velocity_threshold,
+                )
+                metrics.update(extended)
+                
                 results[h].append(metrics)
 
     return {h: _average_metrics(results[h]) for h in horizons}
@@ -299,6 +337,14 @@ def evaluate_with_teacher_forcing(
 
             full_states = states_full[:, :context_length + rollout_length]
 
+            # Determine correct heading_idx
+            angle_feature_idx = 6
+            heading_idx = None
+            if angle_feature_idx in continuous_indices:
+                heading_idx = continuous_indices.index(angle_feature_idx)
+            
+            velocity_threshold = 0.5 if convert_to_meters else 15.0
+            
             # open-loop
             open_pred_cont, _ = model.rollout(
                 initial_states=context_states,
@@ -314,7 +360,15 @@ def evaluate_with_teacher_forcing(
                 masks=target_masks,
                 pixel_to_meter=pixel_to_meter,
                 convert_to_meters=convert_to_meters,
+                heading_idx=heading_idx,
             )
+            open_extended = compute_extended_metrics(
+                predicted=open_pred_cont,
+                ground_truth=target_cont,
+                masks=target_masks,
+                velocity_threshold=velocity_threshold,
+            )
+            open_metrics.update(open_extended)
             open_loop_metrics.append(open_metrics)
 
             # teacher forcing
@@ -333,7 +387,15 @@ def evaluate_with_teacher_forcing(
                 masks=target_masks,
                 pixel_to_meter=pixel_to_meter,
                 convert_to_meters=convert_to_meters,
+                heading_idx=heading_idx,
             )
+            closed_extended = compute_extended_metrics(
+                predicted=closed_pred_cont,
+                ground_truth=target_cont,
+                masks=target_masks,
+                velocity_threshold=velocity_threshold,
+            )
+            closed_metrics.update(closed_extended)
             closed_loop_metrics.append(closed_metrics)
 
     return {"open_loop": _average_metrics(open_loop_metrics), "closed_loop": _average_metrics(closed_loop_metrics)}
@@ -465,7 +527,16 @@ if __name__ == "__main__":
         discrete_indices_fallback = [int(df["class_id"]), int(df["lane_id"]), int(df["site_id"])]
     else:
         discrete_indices_fallback = [7, 8, 11]
-    continuous_indices_fallback = [0, 1, 2, 3, 4, 5, 6, 9, 10]
+    
+    # Determine continuous indices based on n_features
+    n_features = int(metadata.get("n_features", 12))
+    do_not_norm = vi.get("do_not_normalize", ["lane_id", "class_id", "site_id", "angle"])
+    angle_idx = int(vi.get("angle_idx", 6))
+    
+    # Build continuous_indices: all except discrete features and angle
+    all_indices = set(range(n_features))
+    skip_indices = set(discrete_indices_fallback + [angle_idx])
+    continuous_indices_fallback = sorted(list(all_indices - skip_indices))
 
     # compute/load stats (fallback indices)
     resolved_stats_path, mean_cont_t, std_cont_t = _load_stats_or_compute_from_episodes(
