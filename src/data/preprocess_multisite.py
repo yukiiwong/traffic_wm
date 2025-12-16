@@ -274,17 +274,6 @@ def preprocess_all_sites(
         logger.info(f"   Frame range: {start_frames.min()}-{end_frames.max()}")
 
     # Save metadata with validation info
-    F = 6  # Basic features
-    if use_acceleration:
-        F += 2
-    if use_extended_features:
-        F = max(F + 3, 10)
-    if use_site_id:
-        F += 1
-
-    # Calculate num_lanes dynamically from lane_mapping
-    num_lanes = len(lane_mapping) + 1  # +1 for unknown lane (id=0)
-
     # Feature layout documentation with index tracking
     feature_layout = {
         0: "center_x",
@@ -322,6 +311,31 @@ def preprocess_all_sites(
         site_id_idx = idx
         feature_layout[idx] = "site_id"
         idx += 1
+    
+    # Add extended relative features if enabled
+    if use_extended_features:
+        feature_layout[idx] = "rel_x_preceding"
+        idx += 1
+        feature_layout[idx] = "rel_y_preceding"
+        idx += 1
+        feature_layout[idx] = "rel_vx_preceding"
+        idx += 1
+        feature_layout[idx] = "rel_vy_preceding"
+        idx += 1
+        feature_layout[idx] = "rel_x_following"
+        idx += 1
+        feature_layout[idx] = "rel_y_following"
+        idx += 1
+        feature_layout[idx] = "rel_vx_following"
+        idx += 1
+        feature_layout[idx] = "rel_vy_following"
+        idx += 1
+    
+    # Total number of features is the final idx value
+    F = idx
+    
+    # Calculate num_lanes dynamically from lane_mapping
+    num_lanes = len(lane_mapping) + 1  # +1 for unknown lane (id=0)
 
     # Validation info with correct indices
     # angle is at index 6 (before class_id at 7, lane_id at 8)

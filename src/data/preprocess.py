@@ -839,7 +839,7 @@ def preprocess_single_site_with_global_timeline(
         use_extended_features=use_extended_features,
         use_acceleration=use_acceleration,
         use_site_id=use_site_id,
-        use_relative_features=use_relative_features,
+        use_relative_features=use_extended_features,
     )
 
     split_info = f" ({split_name})" if split_name else ""

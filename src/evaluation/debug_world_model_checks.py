@@ -241,6 +241,11 @@ def main():
     p.add_argument("--rollout_horizon", type=int, default=15)
     p.add_argument("--threshold", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=42)
+    # Optional model architecture parameters (for old checkpoints without config)
+    p.add_argument("--input_dim", type=int, default=None, help="Input feature dimension (auto-detect from metadata if not specified)")
+    p.add_argument("--latent_dim", type=int, default=None, help="Latent dimension (auto-detect from checkpoint if not specified)")
+    p.add_argument("--dynamics_layers", type=int, default=None, help="Dynamics transformer layers (default: 4)")
+    p.add_argument("--dynamics_heads", type=int, default=None, help="Attention heads (default: 8)")
     args = p.parse_args()
 
     torch.manual_seed(args.seed)
@@ -259,13 +264,58 @@ def main():
 
     ckpt = torch.load(args.checkpoint, map_location=device)
     state_dict = ckpt["model_state_dict"]
-    latent_dim = infer_latent_dim_from_ckpt(state_dict, 256)
+    model_config = ckpt.get("config", {})
+    
+    # Priority: CLI args > checkpoint config > inference from state_dict
+    if args.input_dim is not None:
+        input_dim = args.input_dim
+    elif "input_dim" in model_config:
+        input_dim = model_config["input_dim"]
+    else:
+        input_dim = int(metadata.get("n_features", 12))
+    
+    if args.latent_dim is not None:
+        latent_dim = args.latent_dim
+    elif "latent_dim" in model_config:
+        latent_dim = model_config["latent_dim"]
+    else:
+        latent_dim = infer_latent_dim_from_ckpt(state_dict, 256)
+    
+    if args.dynamics_layers is not None:
+        dynamics_layers = args.dynamics_layers
+    elif "dynamics_layers" in model_config:
+        dynamics_layers = model_config["dynamics_layers"]
+    else:
+        dynamics_layers = 4
+    
+    if args.dynamics_heads is not None:
+        dynamics_heads = args.dynamics_heads
+    elif "dynamics_heads" in model_config:
+        dynamics_heads = model_config["dynamics_heads"]
+    else:
+        dynamics_heads = 8
+    
+    # Get continuous_dim and max_agents from config or infer
+    if "continuous_dim" in model_config:
+        continuous_dim = int(model_config["continuous_dim"])
+    elif "decoder.state_head.bias" in state_dict:
+        decoder_out = state_dict["decoder.state_head.bias"].shape[0]
+        model_max_agents = int(model_config.get("max_agents", 50))
+        continuous_dim = decoder_out // model_max_agents
+    else:
+        continuous_dim = 9
+    
+    model_max_agents = int(model_config.get("max_agents", 50))
+    
     num_lanes, num_sites, num_classes = infer_embedding_sizes_from_ckpt(state_dict)
-    input_dim = int(metadata.get("n_features", 12))
 
     model = WorldModel(
         input_dim=input_dim,
+        continuous_dim=continuous_dim,
+        max_agents=model_max_agents,
         latent_dim=latent_dim,
+        dynamics_layers=dynamics_layers,
+        dynamics_heads=dynamics_heads,
         num_lanes=num_lanes,
         num_sites=num_sites,
         num_classes=num_classes,

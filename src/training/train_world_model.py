@@ -100,16 +100,18 @@ def setup_logging(log_dir: str) -> logging.Logger:
     return logger
 
 
-def save_checkpoint(path: Path, model: WorldModel, optimizer: optim.Optimizer, epoch: int) -> None:
+def save_checkpoint(path: Path, model: WorldModel, optimizer: optim.Optimizer, epoch: int, config: dict = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-        },
-        str(path),
-    )
+    checkpoint_data = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+    }
+    # Add model config if provided
+    if config is not None:
+        checkpoint_data["config"] = config
+    
+    torch.save(checkpoint_data, str(path))
 
 
 def _safe_div(num, den, eps=1e-8):
@@ -435,8 +437,8 @@ def main() -> None:
     # Log feature classification
     logger.info("=" * 60)
     logger.info("Feature Classification:")
-    logger.info(f"  Continuous features ({len(continuous_indices)}): {[feature_names[i] for i in continuous_indices]}")
-    logger.info(f"  Discrete features ({len(discrete_indices)}): {[feature_names[i] for i in discrete_indices]}")
+    logger.info(f"  Continuous features ({len(continuous_indices)}): {[feature_names.get(i, f'feature_{i}') for i in continuous_indices]}")
+    logger.info(f"  Discrete features ({len(discrete_indices)}): {[feature_names.get(i, f'feature_{i}') for i in discrete_indices]}")
     logger.info(f"  NOTE: MAE metrics will ONLY be computed for continuous features")
     logger.info("=" * 60)
 
@@ -506,6 +508,29 @@ def main() -> None:
         logger.info("No learning rate scheduler")
 
     best_val = float("inf")
+    
+    # Prepare model config for checkpoint saving
+    model_config = {
+        "input_dim": args.input_dim,
+        "continuous_dim": len(continuous_indices),
+        "max_agents": args.max_agents,
+        "latent_dim": args.latent_dim,
+        "dynamics_layers": args.dynamics_layers,
+        "dynamics_heads": args.dynamics_heads,
+        "dt": dt,
+        "max_dynamics_len": args.max_dynamics_len,
+        "max_dynamics_context": args.max_dynamics_context,
+        "num_lanes": num_lanes,
+        "num_sites": num_sites,
+        "num_classes": num_classes,
+        "use_acceleration": bool(meta.get("use_acceleration", True)),
+        "lane_feature_idx": lane_feature_idx,
+        "class_feature_idx": class_feature_idx,
+        "site_feature_idx": site_feature_idx,
+        "continuous_indices": continuous_indices.tolist() if hasattr(continuous_indices, 'tolist') else list(continuous_indices),
+        "discrete_indices": discrete_indices.tolist() if hasattr(discrete_indices, 'tolist') else list(discrete_indices),
+        "angle_idx": angle_idx,
+    }
 
     for epoch in range(args.epochs):
         model.train()
@@ -622,11 +647,11 @@ def main() -> None:
         with open(diag_json_path, "w") as f:
             json.dump(val_metrics, f, indent=2)
 
-        save_checkpoint(ckpt_dir / "checkpoint_last.pt", model, optimizer, epoch)
+        save_checkpoint(ckpt_dir / "checkpoint_last.pt", model, optimizer, epoch, model_config)
 
         if val_loss < best_val:
             best_val = val_loss
-            save_checkpoint(ckpt_dir / "checkpoint_best.pt", model, optimizer, epoch)
+            save_checkpoint(ckpt_dir / "checkpoint_best.pt", model, optimizer, epoch, model_config)
             logger.info(f"New best model saved! val_loss={best_val:.4f}")
 
     logger.info("Training finished.")

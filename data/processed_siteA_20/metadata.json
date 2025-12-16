@@ -1,0 +1,79 @@
+{
+  "n_episodes": 6113,
+  "episode_length": 80,
+  "context_length": 65,
+  "rollout_horizon": 15,
+  "stride": 15,
+  "max_vehicles": 50,
+  "n_features": 20,
+  "fps": 30.0,
+  "dt": 0.03333333333333333,
+  "use_extended_features": true,
+  "use_acceleration": true,
+  "use_site_id": true,
+  "use_chronological_split": true,
+  "train_ratio": 0.7,
+  "val_ratio": 0.15,
+  "test_ratio": 0.15,
+  "lane_mapping": {
+    "A:B5": 1,
+    "A:crossroads1": 2,
+    "A:A4": 3,
+    "A:A5": 4,
+    "A:B2": 5,
+    "A:B3": 6,
+    "A:A3": 7,
+    "A:C4": 8,
+    "A:C5": 9,
+    "A:B4": 10,
+    "A:B1": 11,
+    "A:A2": 12,
+    "A:A6": 13,
+    "A:A1": 14,
+    "A:C3": 15,
+    "A:C2": 16,
+    "A:C1": 17,
+    "A:B7": 18,
+    "A:B6": 19
+  },
+  "sites_processed": [
+    "A"
+  ],
+  "split_sizes": {
+    "train": 4187,
+    "val": 926,
+    "test": 1000
+  },
+  "feature_layout": {
+    "0": "center_x",
+    "1": "center_y",
+    "2": "vx",
+    "3": "vy",
+    "4": "ax",
+    "5": "ay",
+    "6": "angle",
+    "7": "class_id",
+    "8": "lane_id",
+    "9": "has_preceding",
+    "10": "has_following",
+    "11": "site_id"
+  },
+  "validation_info": {
+    "num_lanes": 20,
+    "lane_token_format": "site:lane (e.g., A:A1, B:crossroads1)",
+    "discrete_features": {
+      "lane_id": 8,
+      "class_id": 7,
+      "site_id": 11
+    },
+    "angle_idx": 6,
+    "do_not_normalize": [
+      "lane_id",
+      "class_id",
+      "site_id",
+      "angle"
+    ],
+    "context_length": 65,
+    "rollout_horizon": 15
+  }
+}

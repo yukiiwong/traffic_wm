@@ -351,6 +351,13 @@ def main():
     parser.add_argument("--zoom_margin_px", type=int, default=60)
     parser.add_argument("--arrows_every", type=int, default=0, help="Draw direction arrows every N steps (0 disables).")
     parser.add_argument("--site_id_feat", type=int, default=11)
+    
+    # Model architecture parameters (optional, auto-detect from checkpoint)
+    parser.add_argument("--input_dim", type=int, default=None, help="Input dimension (auto-detect if not provided)")
+    parser.add_argument("--latent_dim", type=int, default=None, help="Latent dimension (auto-detect if not provided)")
+    parser.add_argument("--dynamics_layers", type=int, default=None, help="Dynamics layers (auto-detect if not provided)")
+    parser.add_argument("--dynamics_heads", type=int, default=None, help="Attention heads (auto-detect if not provided)")
+    
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -377,17 +384,65 @@ def main():
 
     ckpt = torch.load(args.checkpoint, map_location=device)
     state_dict = ckpt["model_state_dict"]
-
-    latent_dim = infer_latent_dim_from_ckpt(state_dict, default=256)
+    
+    # Try to get model config from checkpoint (for newer checkpoints)
+    model_config = ckpt.get("config", {})
+    
+    # Priority: CLI args > checkpoint config > inference from state_dict
+    if args.input_dim is not None:
+        input_dim = args.input_dim
+    elif "input_dim" in model_config:
+        input_dim = model_config["input_dim"]
+    else:
+        input_dim = int(metadata.get("n_features", 12))
+    
+    if args.latent_dim is not None:
+        latent_dim = args.latent_dim
+    elif "latent_dim" in model_config:
+        latent_dim = model_config["latent_dim"]
+    else:
+        latent_dim = infer_latent_dim_from_ckpt(state_dict, default=256)
+    
+    if args.dynamics_layers is not None:
+        dynamics_layers = args.dynamics_layers
+    elif "dynamics_layers" in model_config:
+        dynamics_layers = model_config["dynamics_layers"]
+    else:
+        dynamics_layers = 4  # default
+    
+    if args.dynamics_heads is not None:
+        dynamics_heads = args.dynamics_heads
+    elif "dynamics_heads" in model_config:
+        dynamics_heads = model_config["dynamics_heads"]
+    else:
+        dynamics_heads = 8  # default
+    
+    # Get continuous_dim and max_agents from config or infer
+    if "continuous_dim" in model_config:
+        continuous_dim = int(model_config["continuous_dim"])
+    elif "decoder.state_head.bias" in state_dict:
+        # Infer from decoder output size
+        decoder_out = state_dict["decoder.state_head.bias"].shape[0]
+        model_max_agents = int(model_config.get("max_agents", 50))
+        continuous_dim = decoder_out // model_max_agents
+        print(f"  Inferred continuous_dim: {continuous_dim} (decoder output {decoder_out} / {model_max_agents} agents)")
+    else:
+        continuous_dim = 9  # default for 12-dim input
+    
+    model_max_agents = int(model_config.get("max_agents", 50))
+    
     num_lanes, num_sites, num_classes = infer_embedding_sizes_from_ckpt(state_dict)
-    input_dim = int(metadata.get("n_features", 12))
 
     from src.utils.common import parse_discrete_feature_indices_from_metadata
     lane_idx, class_idx, site_idx = parse_discrete_feature_indices_from_metadata(metadata, fallback=(8, 7, 11), strict=False)
 
     model = WorldModel(
         input_dim=input_dim,
+        continuous_dim=continuous_dim,
+        max_agents=model_max_agents,
         latent_dim=latent_dim,
+        dynamics_layers=dynamics_layers,
+        dynamics_heads=dynamics_heads,
         num_lanes=num_lanes,
         num_sites=num_sites,
         num_classes=num_classes,
@@ -398,7 +453,10 @@ def main():
     model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
-    print(f"Model loaded: latent_dim={latent_dim}, num_lanes_ckpt={num_lanes}, num_sites_ckpt={num_sites}, num_classes_ckpt={num_classes}")
+    print(f"Model loaded: input_dim={input_dim}, continuous_dim={continuous_dim}, max_agents={model_max_agents}")
+    print(f"  Architecture: latent_dim={latent_dim}, dynamics_layers={dynamics_layers}, dynamics_heads={dynamics_heads}")
+    print(f"Embeddings: num_lanes={num_lanes}, num_sites={num_sites}, num_classes={num_classes}")
+
 
     # On-the-fly stats from train_episodes.npz (same folder)
     train_npz = str(Path(args.test_data).parent / "train_episodes.npz")

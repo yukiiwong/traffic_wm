@@ -278,6 +278,11 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--num_samples", type=int, default=5)
     parser.add_argument("--max_agents", type=int, default=10)
+    # Optional model architecture parameters (for old checkpoints without config)
+    parser.add_argument("--input_dim", type=int, default=None, help="Input feature dimension (auto-detect from metadata if not specified)")
+    parser.add_argument("--latent_dim", type=int, default=None, help="Latent dimension (auto-detect from checkpoint if not specified)")
+    parser.add_argument("--dynamics_layers", type=int, default=None, help="Dynamics transformer layers (default: 4)")
+    parser.add_argument("--dynamics_heads", type=int, default=None, help="Attention heads (default: 8)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -303,12 +308,50 @@ def main():
     # load checkpoint
     ckpt = torch.load(args.checkpoint, map_location=device)
     state_dict = ckpt["model_state_dict"]
+    model_config = ckpt.get("config", {})
 
-    # infer latent_dim
-    if "encoder.to_latent.0.bias" in state_dict:
+    # Priority: CLI args > checkpoint config > inference from state_dict
+    if args.input_dim is not None:
+        input_dim = args.input_dim
+    elif "input_dim" in model_config:
+        input_dim = model_config["input_dim"]
+    else:
+        input_dim = int(metadata.get("n_features", 12))
+    
+    if args.latent_dim is not None:
+        latent_dim = args.latent_dim
+    elif "latent_dim" in model_config:
+        latent_dim = model_config["latent_dim"]
+    elif "encoder.to_latent.0.bias" in state_dict:
         latent_dim = int(state_dict["encoder.to_latent.0.bias"].shape[0])
     else:
         latent_dim = 256
+    
+    if args.dynamics_layers is not None:
+        dynamics_layers = args.dynamics_layers
+    elif "dynamics_layers" in model_config:
+        dynamics_layers = model_config["dynamics_layers"]
+    else:
+        dynamics_layers = 4
+    
+    if args.dynamics_heads is not None:
+        dynamics_heads = args.dynamics_heads
+    elif "dynamics_heads" in model_config:
+        dynamics_heads = model_config["dynamics_heads"]
+    else:
+        dynamics_heads = 8
+    
+    # Get continuous_dim and max_agents from config or infer
+    if "continuous_dim" in model_config:
+        continuous_dim = int(model_config["continuous_dim"])
+    elif "decoder.state_head.bias" in state_dict:
+        decoder_out = state_dict["decoder.state_head.bias"].shape[0]
+        model_max_agents = int(model_config.get("max_agents", 50))
+        continuous_dim = decoder_out // model_max_agents
+    else:
+        continuous_dim = 9
+    
+    model_max_agents = int(model_config.get("max_agents", 50))
 
     # infer embedding sizes to avoid mismatch
     num_lanes, num_sites, num_classes = _infer_embedding_sizes_from_ckpt(state_dict)
@@ -316,8 +359,12 @@ def main():
     lane_idx, class_idx, site_idx = parse_discrete_feature_indices_from_metadata(metadata, fallback=(8, 7, 11), strict=False)
 
     model = WorldModel(
-        input_dim=int(metadata.get("n_features", 12)),
+        input_dim=input_dim,
+        continuous_dim=continuous_dim,
+        max_agents=model_max_agents,
         latent_dim=latent_dim,
+        dynamics_layers=dynamics_layers,
+        dynamics_heads=dynamics_heads,
         num_lanes=num_lanes,
         num_sites=num_sites,
         num_classes=num_classes,
@@ -329,7 +376,9 @@ def main():
     model = model.to(device)
     model.eval()
 
-    print(f"Model loaded: latent_dim={latent_dim}, num_lanes={num_lanes}, num_sites={num_sites}, num_classes={num_classes}")
+    print(f"Model loaded: input_dim={input_dim}, continuous_dim={continuous_dim}, max_agents={model_max_agents}")
+    print(f"  Architecture: latent_dim={latent_dim}, dynamics_layers={dynamics_layers}, dynamics_heads={dynamics_heads}")
+    print(f"  Embeddings: num_lanes={num_lanes}, num_sites={num_sites}, num_classes={num_classes}")
 
     # compute normalization stats from train_episodes.npz (same folder as test_data)
     train_npz = str(Path(args.test_data).parent / "train_episodes.npz")

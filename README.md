@@ -125,7 +125,7 @@ python src/training/train_world_model.py \
     --train_data data/processed/train_episodes.npz \
     --val_data data/processed/val_episodes.npz \
     --input_dim 12 \
-    --continuous_dim 8 \
+    --continuous_dim 9 \
     --latent_dim 256 \
     --batch_size 16 \
     --epochs 50 \
@@ -133,10 +133,12 @@ python src/training/train_world_model.py \
     --scheduler cosine \
     --angle_weight 2.0
 
-# 4. 评估模型
+# 4. 评估模型（新版checkpoint会自动读取配置，旧版可手动指定参数）
 python src/evaluation/rollout_eval.py \
     --checkpoint checkpoints/best_model.pt \
     --test_data data/processed/test_episodes.npz \
+    --metadata data/processed/metadata.json \
+    --stats_path data/processed/train_episodes.npz \
     --context_length 65 \
     --rollout_horizon 15
 ```
@@ -145,7 +147,7 @@ python src/evaluation/rollout_eval.py \
 
 ```bash
 # 1. 预处理单站点（启用相对特征）
-python src/data/preprocess_multisite.py --sites A --output_dir data/processed_siteA --use_relative_features
+python src/data/preprocess_multisite.py --sites A --output_dir data/processed_siteA --use_extended_features
 
 # 2. 验证数据
 python src/data/validate_preprocessing.py --data_dir data/processed_siteA
@@ -167,10 +169,12 @@ python src/training/train_world_model.py \
     --weight_decay 1e-5 \
     --angle_weight 2.0
 
-# 4. 评估模型
+# 4. 评估模型（新版checkpoint会自动读取配置）
 python src/evaluation/rollout_eval.py \
     --checkpoint checkpoints/world_model_siteA_enhanced/best_model.pt \
-    --test_data data/processed_siteA/test_episodes.npz
+    --test_data data/processed_siteA/test_episodes.npz \
+    --metadata data/processed_siteA/metadata.json \
+    --stats_path data/processed_siteA/train_episodes.npz
 ```
 
 ### 训练参数说明
@@ -187,7 +191,7 @@ python src/evaluation/rollout_eval.py \
 
 **关键超参数**:
 - `--input_dim`: 输入特征维度（12 或 20）
-- `--continuous_dim`: 连续特征维度（8 或 16）
+- `--continuous_dim`: 连续特征维度（9 或 16）
 - `--latent_dim`: 潜在空间维度（推荐 64-256）
 - `--hidden_dim`: Transformer 隐藏维度（推荐 256-512）
 - `--num_heads`: 注意力头数（推荐 4-8）
@@ -240,7 +244,7 @@ data/raw/
 python src/data/preprocess_multisite.py
 
 # 增强配置（20 维特征）⭐ 推荐
-python src/data/preprocess_multisite.py --use_relative_features
+python src/data/preprocess_multisite.py --use_extended_features
 
 # 自定义参数
 python src/data/preprocess_multisite.py \
@@ -252,7 +256,7 @@ python src/data/preprocess_multisite.py \
     --train_ratio 0.7 \
     --val_ratio 0.15 \
     --test_ratio 0.15 \
-    --use_relative_features
+    --use_extended_features
 ```
 
 **处理流程**:
@@ -550,7 +554,7 @@ python src/training/train_world_model.py \
 
 **关键参数**:
 - `--input_dim 12`: 输入维度（必须与metadata.json中的n_features一致）
-- `--continuous_dim 8`: Decoder输出的连续特征维度（12维模式）或1 or 16（20维模式）
+- `--continuous_dim 9`: Decoder输出的连续特征维度（12维模式）或 16（20维模式）
 - `--latent_dim 256`: 潜在空间维度（推荐128-512）
 - `--batch_size 16`: 根据GPU内存调整（默认16）
 - `--epochs 50`: 训练轮数
@@ -993,13 +997,35 @@ checkpoints/world_model/
 
 **命令**:
 ```bash
+# 新版checkpoint（训练时保存了config）会自动读取所有配置
 python src/evaluation/rollout_eval.py \
     --checkpoint checkpoints/best_model.pt \
     --test_data data/processed/test_episodes.npz \
+    --metadata data/processed/metadata.json \
+    --stats_path data/processed/train_episodes.npz \
     --context_length 65 \
     --rollout_horizon 15 \
     --output_dir results/
+
+# 旧版checkpoint（无config）需手动指定模型架构参数
+python src/evaluation/rollout_eval.py \
+    --checkpoint checkpoints/old_model/checkpoint_best.pt \
+    --test_data data/processed/test_episodes.npz \
+    --metadata data/processed/metadata.json \
+    --stats_path data/processed/train_episodes.npz \
+    --input_dim 20 \
+    --latent_dim 512 \
+    --dynamics_layers 6 \
+    --dynamics_heads 16
 ```
+
+**参数优先级**: 命令行参数 > checkpoint config > 自动推断/默认值
+
+**可选模型架构参数**（针对旧版checkpoint）:
+- `--input_dim`: 输入特征维度（12或20），默认从metadata.json读取
+- `--latent_dim`: 潜在空间维度，默认从checkpoint权重推断或使用256
+- `--dynamics_layers`: Dynamics Transformer层数，默认4
+- `--dynamics_heads`: 注意力头数，默认8
 
 **评估流程**:
 
@@ -1145,16 +1171,34 @@ src/evaluation/rollout_eval.py
 
 **命令**:
 ```bash
-python src/evaluation/visualize_predictions.py \
+# 新版checkpoint（自动读取配置）
+python src/evaluation/visualize_predictions_detailed.py \
     --checkpoint checkpoints/best_model.pt \
     --test_data data/processed/test_episodes.npz \
+    --metadata data/processed/metadata.json \
     --site_images_dir src/evaluation/sites \
     --context_length 65 \
     --rollout_horizon 15 \
     --output_dir results/visualizations \
-    --num_samples 5 \
+    --num_samples 50 \
+    --max_agents 10
+
+# 旧版checkpoint（手动指定架构参数）
+python src/evaluation/visualize_predictions_detailed.py \
+    --checkpoint checkpoints/old_model/checkpoint_best.pt \
+    --test_data data/processed/test_episodes.npz \
+    --metadata data/processed/metadata.json \
+    --site_images_dir src/evaluation/sites \
+    --input_dim 20 \
+    --latent_dim 512 \
+    --dynamics_layers 6 \
+    --dynamics_heads 16 \
+    --output_dir results/visualizations \
+    --num_samples 50 \
     --max_agents 10
 ```
+
+**注意**: `--max_agents` 是可视化参数（限制图中显示的agent数量），不是模型参数
 
 **可视化流程**:
 
@@ -1249,6 +1293,13 @@ src/evaluation/visualize_predictions.py
 ### 步骤2: Attention权重可视化
 
 **代码文件**: `src/evaluation/attention_visualization.py`
+
+**其他可用的可视化/调试脚本**:
+- 📄 `src/evaluation/visualize_predictions.py` - 基础版可视化（简化版）
+- 📄 `src/evaluation/visualize_predictions_wm.py` - 高级可视化（支持采样策略、agent选择）
+- 📄 `src/evaluation/debug_world_model_checks.py` - 模型诊断（检查open-loop、teacher-forcing等模式）
+
+**注**: 所有evaluation脚本都支持 `--input_dim`, `--latent_dim`, `--dynamics_layers`, `--dynamics_heads` 参数用于加载旧版checkpoint
 
 ```bash
 python src/evaluation/attention_visualization.py \
@@ -1708,7 +1759,7 @@ python src/data/preprocess_multisite.py --sites A
 python src/data/reprocess_with_relative_features.py --site A
 
 # 或者从头开始
-python src/data/preprocess_multisite.py --sites A --use_relative_features
+python src/data/preprocess_multisite.py --sites A --use_extended_features
 ```
 
 ### 问题8: 二值特征预测精度低

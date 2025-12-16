@@ -364,6 +364,12 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=8, help="Batch size for evaluation")
     parser.add_argument("--output_dir", type=str, default="results/", help="Directory to save results")
     parser.add_argument("--convert_to_meters", action="store_true", default=True, help="Convert to meters (default: True)")
+    
+    # Model architecture parameters (optional, will be read from checkpoint if available)
+    parser.add_argument("--input_dim", type=int, default=None, help="Input feature dimension (auto-detect if not provided)")
+    parser.add_argument("--latent_dim", type=int, default=None, help="Latent dimension (auto-detect if not provided)")
+    parser.add_argument("--dynamics_layers", type=int, default=None, help="Number of dynamics layers (auto-detect if not provided)")
+    parser.add_argument("--dynamics_heads", type=int, default=None, help="Number of attention heads (auto-detect if not provided)")
 
     args = parser.parse_args()
 
@@ -386,20 +392,45 @@ if __name__ == "__main__":
     checkpoint = torch.load(args.checkpoint, map_location=device)
     state_dict = checkpoint["model_state_dict"]
 
-    # infer dims from checkpoint
+    # Priority: 1. command line args, 2. checkpoint config, 3. inference/defaults
     if "config" in checkpoint:
         cfg = checkpoint["config"]
-        input_dim = int(cfg.get("input_dim", n_features))
-        latent_dim = int(cfg.get("latent_dim", 256))
+        input_dim = args.input_dim if args.input_dim is not None else int(cfg.get("input_dim", n_features))
+        latent_dim = args.latent_dim if args.latent_dim is not None else int(cfg.get("latent_dim", 256))
+        dynamics_layers = args.dynamics_layers if args.dynamics_layers is not None else int(cfg.get("dynamics_layers", 4))
+        dynamics_heads = args.dynamics_heads if args.dynamics_heads is not None else int(cfg.get("dynamics_heads", 8))
+        continuous_dim = int(cfg.get("continuous_dim", 9))
+        print(f"✅ Loaded config from checkpoint")
     else:
-        print("Warning: No config found in checkpoint, inferring from state_dict")
-        input_dim = n_features
-        if "encoder.to_latent.0.bias" in state_dict:
+        print("Warning: No config found in checkpoint, using args or inferring from state_dict")
+        input_dim = args.input_dim if args.input_dim is not None else n_features
+        dynamics_layers = args.dynamics_layers if args.dynamics_layers is not None else 4
+        dynamics_heads = args.dynamics_heads if args.dynamics_heads is not None else 8
+        
+        if args.latent_dim is not None:
+            latent_dim = args.latent_dim
+        elif "encoder.to_latent.0.bias" in state_dict:
             latent_dim = int(state_dict["encoder.to_latent.0.bias"].shape[0])
             print(f"  Inferred latent_dim: {latent_dim}")
         else:
             latent_dim = 256
             print(f"  Could not infer latent_dim, using default: {latent_dim}")
+        
+        # Try to infer continuous_dim from decoder output
+        if "decoder.state_head.bias" in state_dict:
+            decoder_out = state_dict["decoder.state_head.bias"].shape[0]
+            max_agents = 50  # assume default
+            continuous_dim = decoder_out // max_agents
+            print(f"  Inferred continuous_dim: {continuous_dim} (decoder output {decoder_out} / {max_agents} agents)")
+        else:
+            continuous_dim = 9
+    
+    # Get max_agents from config or use default
+    max_agents = int(cfg.get("max_agents", 50)) if "config" in checkpoint else 50
+    
+    print(f"Model config: input_dim={input_dim}, latent_dim={latent_dim}, "
+          f"dynamics_layers={dynamics_layers}, dynamics_heads={dynamics_heads}, "
+          f"continuous_dim={continuous_dim}, max_agents={max_agents}")
 
     num_lanes_ckpt, num_sites_ckpt, num_classes_ckpt = _infer_embedding_sizes_from_ckpt(state_dict)
     print(f"✅ Using embedding sizes from checkpoint: num_lanes={num_lanes_ckpt}, num_sites={num_sites_ckpt}, num_classes={num_classes_ckpt}")
@@ -411,7 +442,11 @@ if __name__ == "__main__":
 
     model = WorldModel(
         input_dim=input_dim,
+        continuous_dim=continuous_dim,
+        max_agents=max_agents,
         latent_dim=latent_dim,
+        dynamics_layers=dynamics_layers,
+        dynamics_heads=dynamics_heads,
         num_lanes=num_lanes_ckpt,
         num_sites=num_sites_ckpt,
         num_classes=num_classes_ckpt,
