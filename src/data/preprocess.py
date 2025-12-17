@@ -1106,26 +1106,10 @@ def preprocess_trajectories(
     logger.info(f"Feature count: {all_episodes[0]['states'].shape[-1]}")
 
 
-if __name__ == '__main__':
-    # Example usage - Extended features mode (recommended)
-    preprocess_trajectories(
-        input_dir='../../data/raw',
-        output_dir='../../data/processed',
-        episode_length=30,
-        max_vehicles=50,
-        overlap=5,
-        fps=30.0,
-        use_extended_features=True,  # Enable lane + relationship features
-        use_acceleration=False,       # Optional: add acceleration
-        use_relative_features=True,   # Enable relative position/velocity features
-        split_data=True,              # Split into train/val/test
-        save_metadata=True            # Save metadata JSON
-    )
+"""Legacy/low-level preprocessing helpers.
 
-    # For basic mode (6 features), use:
-    # preprocess_trajectories(
-    #     input_dir='../../data/raw',
-    #     output_dir='../../data/processed',
-    #     use_extended_features=False,
-    #     split_data=False
-    # )
+This module is imported by the supported entrypoint:
+    - src/data/preprocess_multisite.py
+
+To generate processed datasets, run preprocess_multisite (or ./preprocess.sh).
+"""

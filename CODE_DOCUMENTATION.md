@@ -140,7 +140,9 @@ contracts*, and *behavioral gotchas* that affect training/eval correctness.
 
 **`preprocess_trajectories(input_dir, output_dir, ...) -> None`**
 - **作用**: 旧版完整预处理流程 (不使用global timeline)
-- **注**: 主要用于向后兼容
+- **注**: 主要用于向后兼容（内部函数，不作为对外CLI入口）
+
+> ✅ 唯一推荐/支持的预处理入口是 `src/data/preprocess_multisite.py`（负责 multi-site + split + 写出 `normalization_stats.npz`）。
 
 ---
 

@@ -10,9 +10,24 @@ teacher-forced one-step 训练与 open-loop rollout 评估/可视化。
 
 ## 快速开始
 
+### 0) 新建 Conda 环境（推荐）
+
+```bash
+# 1) 创建并激活环境
+conda create -n traffic_wm python=3.10 -y
+conda activate traffic_wm
+
+# 2) 安装依赖（包含 torch / pandas / matplotlib 等）
+pip install -U pip
+pip install -r requirements.txt
+```
+
+说明:
+- 如果你需要 GPU/CUDA 版本的 PyTorch，请根据你机器的 CUDA 版本安装匹配的 `torch` 构建；本仓库其余依赖不依赖特定 CUDA。
+
 ### 1) 数据预处理
 
-入口脚本: `src/data/preprocess_multisite.py`
+唯一入口脚本: `src/data/preprocess_multisite.py`（推荐用 `./preprocess.sh` 包一层快捷调用）
 
 ```bash
 python src/data/preprocess_multisite.py \
@@ -23,6 +38,9 @@ python src/data/preprocess_multisite.py \
   --stride 15 \
   --max_agents 50
 
+# 等价写法（推荐，参数原样透传）
+# ./preprocess.sh --raw_data_dir data/raw --output_dir data/processed_siteA --sites A --episode_length 80 --stride 15 --max_agents 50
+
 ls data/processed_siteA/
 # train_episodes.npz  val_episodes.npz  test_episodes.npz  metadata.json  normalization_stats.npz
 ```
@@ -31,6 +49,7 @@ ls data/processed_siteA/
 - `.npz` 存储的是预处理的基础特征（默认 20 维）。
 - Dataset 会在加载时动态计算并追加 4 个派生特征（见下文）。
 - 速度/加速度的差分会按真实帧间隔（frame gap）进行时间尺度修正，避免缺帧造成速度爆炸。
+- `src/data/preprocess.py` 是底层/legacy helper（被 `preprocess_multisite.py` 调用），不作为对外入口。
 
 ### 2) 训练
 
@@ -271,8 +290,10 @@ traffic_wm/
 ├── src/
 │   ├── data/
 │   │   ├── preprocess_multisite.py  # 数据预处理
+│   │   ├── preprocess.py             # 底层/legacy helper（不作为入口）
 │   │   ├── dataset.py               # Dataset类
-│   │   └── split_strategy.py        # 划分策略
+│   │   ├── split_strategy.py        # 划分策略
+│   │   └── validate_preprocessing.py # 预处理结果自检
 │   ├── models/
 │   │   ├── world_model.py           # 完整模型
 │   │   ├── encoder.py               # Encoder

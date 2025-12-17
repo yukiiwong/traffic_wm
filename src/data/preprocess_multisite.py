@@ -46,6 +46,7 @@ def preprocess_all_sites(
     use_site_id: bool = True,
     use_chronological_split: bool = True,
     sites: list = None,
+    save_normalization_stats: bool = True,
 ):
     """
     Preprocess all sites using improved pipeline with global timeline.
@@ -99,6 +100,7 @@ def preprocess_all_sites(
     logger.info(f"Site ID: {use_site_id}")
     logger.info(f"Split type: {'Chronological' if use_chronological_split else 'Random'}")
     logger.info(f"Split ratios: {train_ratio:.0%} train / {val_ratio:.0%} val / {test_ratio:.0%} test")
+    logger.info(f"Save normalization stats: {save_normalization_stats}")
     logger.info("=" * 60)
 
     # Get available sites
@@ -408,6 +410,25 @@ def preprocess_all_sites(
             json.dump(split_config, f, indent=2)
         logger.info(f"✅ Saved split config to {config_path}")
 
+    # Optionally compute and save normalization stats for convenience.
+    # This mirrors training behavior: compute stats on train split, then reuse for val/test.
+    if save_normalization_stats:
+        try:
+            from src.data.dataset import TrajectoryDataset
+
+            train_npz = output_dir / 'train_episodes.npz'
+            stats_npz = output_dir / 'normalization_stats.npz'
+
+            if train_npz.exists() and not stats_npz.exists():
+                logger.info("\n" + "=" * 60)
+                logger.info("COMPUTING NORMALIZATION STATS (train split)")
+                logger.info("=" * 60)
+                ds = TrajectoryDataset(str(train_npz), normalize=True, stats_path=None)
+                ds.save_stats(str(stats_npz))
+                logger.info(f"✅ Saved normalization stats to {stats_npz}")
+        except Exception as e:
+            logger.warning(f"⚠️  Failed to compute normalization stats: {e}")
+
     logger.info("\n" + "=" * 60)
     logger.info("✅ PREPROCESSING COMPLETE!")
     logger.info("=" * 60)
@@ -477,6 +498,12 @@ def main():
     parser.add_argument('--no_save_split_config', action='store_true',
                        help='Do not save split config JSON')
 
+    parser.add_argument('--save_normalization_stats', action='store_true', default=True,
+                       help='Compute and save normalization_stats.npz in output_dir (default: enabled)')
+    parser.add_argument('--no-save_normalization_stats', dest='save_normalization_stats',
+                       action='store_false',
+                       help='Disable writing normalization_stats.npz')
+
     args = parser.parse_args()
 
     # Run preprocessing
@@ -493,6 +520,8 @@ def main():
         val_ratio=args.val_ratio,
         test_ratio=args.test_ratio,
         save_split_config=not args.no_save_split_config,
+        save_normalization_stats=args.save_normalization_stats,
+        use_site_id=True,
         use_chronological_split=args.use_chronological_split,
         sites=args.sites
     )
