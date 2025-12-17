@@ -14,6 +14,7 @@
 DATA_DIR="data/processed_siteA_20"
 EXPERIMENT_NAME="simplified_interaction_vel_dir"
 LOG_DIR="experiments/${EXPERIMENT_NAME}"
+STATS_PATH="${DATA_DIR}/normalization_stats.npz"
 
 echo "========================================="
 echo "Training with Simplified Features"
@@ -49,6 +50,7 @@ echo ""
 python src/training/train_world_model.py \
   --train_data "${DATA_DIR}/train_episodes.npz" \
   --val_data "${DATA_DIR}/val_episodes.npz" \
+  --stats_path "${STATS_PATH}" \
   --log_dir "${LOG_DIR}" \
   --epochs 200 \
   --batch_size 32 \
@@ -63,6 +65,11 @@ python src/training/train_world_model.py \
   --eval_interval 10 \
   --save_interval 20 \
   --num_workers 4
+
+# Optional (recommended when vx/vy is noisy due to mask gaps):
+#   --disable_vxy_supervision \
+#   --short_rollout_horizon 5 --short_rollout_weight 1.0 \
+#   --scheduled_sampling_start 0.0 --scheduled_sampling_end 0.3
 
 echo ""
 echo "========================================="

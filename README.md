@@ -1,157 +1,143 @@
+"""Traffic World Model (traffic_wm)
+
+基于 Transformer 的多智能体轨迹世界模型，用于多站点无人机车辆轨迹数据的
+teacher-forced one-step 训练与 open-loop rollout 评估/可视化。
+
+本仓库的默认坐标单位是像素（pixel），时间采样为 30 FPS。
+"""
+
 # Traffic World Model - 多智能体轨迹预测
-
-基于Transformer的潜在世界模型，用于多站点无人机轨迹数据的预测和仿真。
-
-## 特征配置 (v2.5)
-
-- **总特征数**: 24 (20原始 + 4派生)
-- **Continuous**: 15个 - 基本运动(6) + 前车交互(5) + 派生特征(4)
-- **派生特征**: velocity_direction, headway, ttc, preceding_distance
-- **Loss**: reconstruction + prediction + velocity_direction_loss
-
----
 
 ## 快速开始
 
-### 1. 数据预处理
+### 1) 数据预处理
 
-**代码**: `src/data/preprocess_multisite.py`
+入口脚本: `src/data/preprocess_multisite.py`
 
 ```bash
-# 预处理Site A数据（20维特征）
 python src/data/preprocess_multisite.py \
-    --raw_data_dir data/raw \
-    --output_dir data/processed_siteA_20 \
-    --sites A \
-    --episode_length 80 \
-    --stride 15 \
-    --max_agents 50
+  --raw_data_dir data/raw \
+  --output_dir data/processed_siteA \
+  --sites A \
+  --episode_length 80 \
+  --stride 15 \
+  --max_agents 50
 
-# 查看生成的文件
-ls data/processed_siteA_20/
-# 输出: train_episodes.npz  val_episodes.npz  test_episodes.npz  metadata.json  normalization_stats.npz
+ls data/processed_siteA/
+# train_episodes.npz  val_episodes.npz  test_episodes.npz  metadata.json  normalization_stats.npz
 ```
 
-### 2. 模型训练
+关键点:
+- `.npz` 存储的是预处理的基础特征（默认 20 维）。
+- Dataset 会在加载时动态计算并追加 4 个派生特征（见下文）。
+- 速度/加速度的差分会按真实帧间隔（frame gap）进行时间尺度修正，避免缺帧造成速度爆炸。
 
-**代码**: `src/training/train_world_model.py`, `src/training/losses.py`
+### 2) 训练
+
+入口: `src/training/train_world_model.py`
 
 ```bash
-# 使用训练脚本（推荐）
-./train_with_interaction_and_vel_dir.sh
-
-# 或手动训练
 python src/training/train_world_model.py \
-    --train_data data/processed_siteA_20/train_episodes.npz \
-    --val_data data/processed_siteA_20/val_episodes.npz \
-    --log_dir experiments/simplified_vel_dir \
-    --epochs 200 \
-    --batch_size 32 \
-    --learning_rate 1e-4 \
-    --latent_dim 512 \
-    --dynamics_layers 6 \
-    --num_heads 16 \
-    --recon_weight 1.0 \
-    --pred_weight 1.0 \
-    --velocity_direction_weight 0.3 \
-    --velocity_threshold 0.5 \
-    --eval_interval 10 \
-    --save_interval 20 \
-    --num_workers 4
+  --train_data data/processed_siteA/train_episodes.npz \
+  --val_data data/processed_siteA/val_episodes.npz \
+  --stats_path data/processed_siteA/normalization_stats.npz \
+  --log_dir experiments/wm_siteA \
+  --epochs 200 \
+  --batch_size 32 \
+  --learning_rate 1e-4 \
+  --eval_interval 10 \
+  --save_interval 20
 ```
 
-### 3. 模型评估
+训练相关的常用稳定器开关（可按需启用）:
+- `--disable_vxy_supervision`: vx/vy 仍作为输入，但不再作为监督目标；日志中 vx/vy-based 的方向指标会标注为 diag-only。
+- `--short_rollout_horizon`, `--short_rollout_weight`: 短 open-loop rollout 的 xy loss（更贴近 rollout 行为）。
+- `--scheduled_sampling_start`, `--scheduled_sampling_end`: scheduled sampling（逐步从 teacher forcing 过渡到自回归）。
+- `--boundary_weight` 等: soft boundary penalty（约束轨迹不要跑出画面范围）。
 
-**代码**: `src/evaluation/rollout_eval.py`, `src/evaluation/prediction_metrics.py`
+### 3) 评估（rollout）
+
+入口: `src/evaluation/rollout_eval.py`
 
 ```bash
-# Rollout评估（生成完整轨迹预测）
 python src/evaluation/rollout_eval.py \
-    --checkpoint experiments/simplified_vel_dir/best_model.pth \
-    --test_data data/processed_siteA_20/test_episodes.npz \
-    --output_dir results/rollout_eval \
-    --num_episodes 100 \
-    --save_predictions
-
-# 查看评估指标
-cat results/rollout_eval/metrics.json
+  --checkpoint experiments/wm_siteA/best_model.pth \
+  --test_data data/processed_siteA/test_episodes.npz \
+  --stats_path data/processed_siteA/normalization_stats.npz \
+  --output_dir results/rollout_eval \
+  --num_episodes 100 \
+  --save_predictions
 ```
 
-### 4. 可视化
+### 4) 可视化
 
-**代码**: `src/evaluation/visualize_predictions_detailed.py`
+静态图: `src/evaluation/visualize_predictions_detailed.py`
 
 ```bash
-# 生成详细可视化（GT vs Pred轨迹对比）
 python src/evaluation/visualize_predictions_detailed.py \
-    --checkpoint experiments/simplified_vel_dir/best_model.pth \
-    --test_data data/processed_siteA_20/test_episodes.npz \
-    --output_dir results/visualization \
-    --num_episodes 10 \
-    --selection_mode presence
-
-# 输出: results/visualization/episode_*.png
+  --checkpoint experiments/wm_siteA/best_model.pth \
+  --test_data data/processed_siteA/test_episodes.npz \
+  --stats_path data/processed_siteA/normalization_stats.npz \
+  --output_dir results/visualization \
+  --num_episodes 10 \
+  --selection_mode presence
 ```
 
----
+说明:
+- 绘图是 mask-aware 的：在 mask 断点处会断线，避免 padding → real 的“超长线”伪像。
 
-## 特征详细说明
+## 特征说明（高层）
 
-### 输入特征 (20维原始)
+### 预处理输出（默认 20 维，存储于 .npz）
 
+基础运动 (6):
+- `[0-5]`: center_x, center_y, vx, vy, ax, ay
+
+离散/ID 类特征（来自 metadata 配置，通常包含）:
+- angle / class_id / lane_id / site_id 等
+
+交互（通常包含前车与后车相关字段）:
+- has_preceding + 相对位置/速度
+- has_following + 相对位置/速度
+
+### Dataset 动态追加派生特征（4 维）
+
+在 `src/data/dataset.py` 中动态计算并拼接到 state 末尾:
+- `[20]`: velocity_direction = atan2(vy, vx)
+- `[21]`: headway = rel_x_preceding
+- `[22]`: ttc（接近时的 time-to-collision）
+- `[23]`: preceding_distance = sqrt(rel_x^2 + rel_y^2)
+
+最终 `__getitem__` 返回的 `states` 维度是 `[T, K, 24]`。
+
+更完整的模块说明与关键实现细节见 `CODE_DOCUMENTATION.md`。
+特征转换 (dataset.py.__getitem__)
+  ├─ 排除后车特征 [10,16-19]
+  ├─ 计算派生特征 [20-23]
+  └─ 输出15维continuous特征
+           ↓
+训练 (train_world_model.py)
+  ├─ 从dataset读取continuous_indices
+  ├─ 自动适配特征维度
+  └─ Loss计算基于15维特征
+           ↓
+评估 (rollout_eval.py)
+  ├─ 从dataset读取continuous_indices
+  ├─ 自动适配特征维度
+  └─ Metrics计算基于15维特征
 ```
-基本运动 (6):
-  [0-5]: center_x, center_y, vx, vy, ax, ay
 
-离散特征 (3):
-  [6]: angle       - 车辆朝向角
-  [7]: class_id    - 车辆类别  
-  [8]: lane_id     - 车道ID
-  [11]: site_id    - 站点ID
-
-前车交互 (5):
-  [9]:  has_preceding      - 是否有前车
-  [12]: rel_x_preceding    - 前车相对x
-  [13]: rel_y_preceding    - 前车相对y
-  [14]: rel_vx_preceding   - 前车相对vx
-  [15]: rel_vy_preceding   - 前车相对vy
-
-后车交互 (5) - 已排除:
-  [10]: has_following      
-  [16-19]: rel_*_following
-```
-
-### 派生特征 (4维，动态计算)
-
-```
-[20]: velocity_direction  = atan2(vy, vx)
-[21]: headway            = rel_x_preceding
-[22]: ttc                = -distance / rel_vx (if approaching)
-[23]: preceding_distance = sqrt(rel_x² + rel_y²)
-```
-
-### Continuous特征 (15维用于训练)
-
-```
-[0,1,2,3,4,5,9,12,13,14,15,20,21,22,23]
-```
-
----
-
-## 代码文件说明
-
-### 数据处理
-```
-src/data/preprocess_multisite.py  - 主预处理脚本
-src/data/dataset.py                - PyTorch Dataset (动态添加派生特征)
-src/data/split_strategy.py         - Train/Val/Test划分策略
-```
+**代码自动适配机制**:
+- ✅ 训练代码从`dataset.continuous_indices`自动读取特征配置
+- ✅ 评估代码优先使用`dataset.continuous_indices`，否则从metadata读取
+- ✅ 切换预处理参数后，只需重新生成数据，训练/评估代码无需修改
+- ⚠️ 如果使用基础配置（12维），派生特征和部分Loss无法使用
 
 ### 模型训练
 ```
-src/training/train_world_model.py  - 训练主脚本
-src/training/losses.py             - Loss函数 (含velocity_direction_loss)
-src/models/world_model.py          - 完整模型
+src/training/train_world_model.py  - 训练主脚本（自动读取continuous_indices）
+src/training/losses.py             - Loss函数（含velocity_direction_loss）
+src/models/world_model.py          - 完整模型（特征维度自适应）
 src/models/encoder.py              - Transformer Encoder
 src/models/dynamics.py             - Transformer Dynamics
 src/models/decoder.py              - MLP Decoder

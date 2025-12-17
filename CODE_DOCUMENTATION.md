@@ -1,263 +1,107 @@
-# Traffic World Model - 代码文档
+"""Traffic World Model - code documentation.
 
-**完整的函数级代码说明文档**
+This repository evolved quickly and the previous function-by-function document
+became stale. This file intentionally documents *entry points*, *data/layout
+contracts*, and *behavioral gotchas* that affect training/eval correctness.
+"""
 
-本文档详细说明了Traffic World Model项目中所有代码文件及其函数的作用。
+# Traffic World Model - 代码文档（维护版）
 
----
+## 入口与工作流
 
-## 目录
+- 预处理（raw CSV → episodes.npz）: `src/data/preprocess_multisite.py`
+- Dataset / DataLoader: `src/data/dataset.py`
+- 模型（含 rollout & kinematic prior）: `src/models/world_model.py`
+- 训练入口: `src/training/train_world_model.py`
+- loss 组合与权重: `src/training/losses.py`
+- rollout 评估: `src/evaluation/rollout_eval.py`
+- 指标: `src/evaluation/prediction_metrics.py`
+- 可视化（静态/动画）:
+  - `src/evaluation/visualize_predictions_detailed.py`
+  - `src/evaluation/visualize_predictions_wm.py`
 
-1. [项目概述](#项目概述)
-2. [预处理脚本](#预处理脚本)
-3. [数据处理模块](#数据处理模块)
-4. [模型架构模块](#模型架构模块)
-5. [训练模块](#训练模块)
-6. [评估模块](#评估模块)
-7. [工具模块](#工具模块)
+## 数据契约（必须一致的部分）
 
----
+### 时间与单位
 
-## 项目概述
+- 默认帧率: 30 FPS
+- 默认单位: 像素（pixel）
 
-**项目名称**: Traffic World Model
-**目标**: 基于Transformer的多智能体轨迹预测世界模型
-**数据来源**: 多站点无人机车辆跟踪数据 (Sites A-I)
-**核心架构**: Encoder (Multi-Agent Transformer) → Dynamics (Transformer) → Decoder (with Kinematic Prior)
+### masks 的语义
 
----
+`masks[t, k] = 1` 表示 agent slot `k` 在时间 `t` 有效。
+重要影响:
+- 差分（位置→速度/加速度）若跨越 mask gap，会产生伪速度。
+- 绘图若不在 mask gap 处断线，会出现“超长线”伪像。
 
-## 预处理脚本
+## 预处理要点
 
-### 📄 `preprocess_multisite.py`
+文件: `src/data/preprocess.py`
 
-多站点数据预处理的主脚本,实现全局时间线构建、时序划分和episode提取。
+关键点:
+- 会构建全局时间线（避免跨 CSV 的 frame 重置）并做 chronological split。
+- 速度/加速度的差分应按真实帧间隔（frame gap * dt）缩放，减弱缺帧导致的速度爆炸。
 
-#### 主要函数
+文件: `src/data/preprocess_multisite.py`
 
-**`main()`**
-- **作用**: 预处理主入口函数
-- **流程**:
-  1. 解析命令行参数(episode_length, stride, train/val/test ratios)
-  2. 遍历所有站点(A-I),为每个站点调用`preprocess_single_site_with_global_timeline`
-  3. 使用Scheme A (chronological split):
-     - 计算全局frame cutoffs: `train_cutoff = 70%`, `val_cutoff = 85%`
-     - 为train/val/test分别提取episodes (使用`frame_range`参数防止overlap)
-  4. 保存NPZ文件(states, masks, scene_ids, start_frames, end_frames)
-  5. 生成metadata.json (包含feature_layout, lane_mapping, validation_info)
-- **输出**:
-  - `data/processed/train_episodes.npz`
-  - `data/processed/val_episodes.npz`
-  - `data/processed/test_episodes.npz`
-  - `data/processed/metadata.json`
+关键点:
+- 负责多站点循环、split、保存 `train_episodes.npz/val_episodes.npz/test_episodes.npz` 与 `metadata.json`。
 
----
+## Dataset 与特征布局
 
-### 📄 `validate_preprocessing.py`
+文件: `src/data/dataset.py`
 
-验证预处理结果的完整性和正确性。
+核心行为:
+- 从 `metadata.json` 读取离散特征索引（如 lane/class/site 等），并避免对其做 z-score。
+- 会动态追加 4 个派生特征到 state 末尾（最终 `states` 为 `[T, K, 24]`）。
+- val/test 必须显式提供 train 的 `stats_path`，避免归一化不一致。
 
-#### 主要函数
+派生特征（按 `__getitem__` 逻辑）:
+- velocity_direction, headway, ttc, preceding_distance
 
-**`load_metadata(processed_dir: Path) -> dict`**
-- **作用**: 加载并返回metadata.json文件
-- **参数**: `processed_dir` - 数据目录路径
-- **返回**: metadata字典
-- **错误处理**: 文件不存在时返回None
+## 训练与关键开关
 
-**`check_metadata_consistency(metadata: dict) -> bool`**
-- **作用**: 检查metadata中的关键参数是否正确
-- **验证项**:
-  - `fps = 30.0`
-  - `dt = 1/30 ≈ 0.0333`
-  - `episode_length = 80`
-  - `context_length = 65`, `rollout_horizon = 15`
-- **返回**: 通过返回True,否则返回False
+文件: `src/training/train_world_model.py`
 
-**`check_lane_mapping(metadata: dict) -> bool`**
-- **作用**: 验证lane_mapping是否使用"site:lane"格式
-- **检查内容**:
-  - Lane token格式: "A:A1", "B:crossroads1" (包含冒号)
-  - Site prefix存在性
-- **返回**: 格式正确返回True
+### `--disable_vxy_supervision`
 
-**`check_split_ranges(processed_dir: Path, metadata: dict) -> bool`**
-- **作用**: 检查train/val/test splits的时间范围不重叠
-- **验证逻辑**:
-  - 加载所有NPZ文件的start_frames/end_frames
-  - 检查: `train_max_end < val_min_start`
-  - 检查: `val_max_end < test_min_start`
-- **输出**: 打印gap大小,检测到overlap时返回False
+含义:
+- vx/vy 仍作为输入特征存在（模型可使用），但不作为回归监督目标。
 
-**`check_feature_dimensions(processed_dir: Path, metadata: dict) -> bool`**
-- **作用**: 验证实际数据维度与metadata一致
-- **检查**:
-  - `states.shape[-1] == metadata['n_features']`
-  - `T == episode_length`
-  - `K == max_vehicles`
+原因:
+- vx/vy 很容易被缺帧/重现（mask 0→1）引入的差分噪声污染。
 
-**`check_discrete_features(metadata: dict) -> bool`**
-- **作用**: 检查离散特征是否正确标记
-- **输出**: 打印discrete_features索引和do_not_normalize列表
+配套行为:
+- vx/vy-based 的 VEL-DIR 指标会在日志里标注为 diag-only。
+- open-loop rollout 的 kinematic prior 在该模式下会优先使用由预测位置差分得到的速度（v = Δp / dt），避免依赖模型生成的 vx/vy。
 
-**`main()`**
-- **作用**: 执行所有验证检查并生成报告
-- **流程**: 运行5个检查函数,汇总结果,输出PASS/FAIL
-- **退出码**: 全部通过返回0,否则返回1
+### short open-loop rollout loss
 
----
+- 用短 horizon 的 open-loop rollout 位置误差（xy-only）作为辅助 loss，更贴近真实 rollout 行为。
 
-## 数据处理模块
+### scheduled sampling
 
-### 📄 `src/data/preprocess.py`
+- 在 teacher forcing 与自回归之间做平滑过渡，降低训练/推理暴露偏差。
 
-核心预处理逻辑,包含轨迹数据处理、特征提取、episode生成。
+### soft boundary penalty
 
-#### CSV加载与特征计算
+- 对越界位置施加软约束，减少 open-loop 跑飞。
 
-**`load_csv_trajectory(csv_path: str) -> pd.DataFrame`**
-- **作用**: 加载单个CSV轨迹文件
-- **返回**: 包含track_id, frame, center_x, center_y等列的DataFrame
-- **日志**: 打印行数和unique vehicles数量
+## 评估与可视化
 
-**`compute_velocities(df: pd.DataFrame, dt: float = 1.0/30) -> pd.DataFrame`**
-- **作用**: 从位置差分计算速度
-- **算法**:
-  ```python
-  vx = groupby('track_id')['center_x'].diff() / dt
-  vy = groupby('track_id')['center_y'].diff() / dt
-  ```
-- **处理**: 第一帧速度填充为0
-- **参数**: `dt` - 时间步长 (默认30 FPS → 0.0333秒)
+### 指标计算空间
 
-**`compute_acceleration(df: pd.DataFrame, dt: float = 1.0/30) -> pd.DataFrame`**
-- **作用**: 从速度差分计算加速度
-- **算法**:
-  ```python
-  ax = groupby('track_id')['vx'].diff() / dt
-  ay = groupby('track_id')['vy'].diff() / dt
-  ```
+方向/角度相关指标应在反归一化后的物理/像素空间计算，避免在归一化空间因各向异性 std 扭曲角度。
 
-**`encode_lane(lane_str: str, lane_mapping: Dict[str, int], site: str = None) -> int`**
-- **作用**: 将lane字符串编码为整数,使用site-specific token防止碰撞
-- **逻辑**:
-  - 创建lane_token: `f"{site}:{lane_str}"` (e.g., "A:A1")
-  - 如果不在lane_mapping中,分配新ID: `len(lane_mapping) + 1`
-- **返回**: 编码后的lane ID (0表示unknown)
+### mask-aware 轨迹绘制
 
-#### 全局时间线构建
+可视化脚本会在 mask gap 处插入 NaN 以断线，避免 padding → real 的连接导致误读。
 
-**`build_global_timeline(site_dfs: List[Tuple[str, pd.DataFrame]], fps: float = 30.0) -> pd.DataFrame`**
-- **作用**: 为单个站点的多个CSV文件构建全局时间线
-- **核心功能**:
-  1. **全局track ID**: `file_id * 1_000_000 + original_track_id`
-  2. **全局frame**: 累积偏移量 `frame + prev_max_frame + 1`
-- **处理步骤**:
-  ```python
-  for file_id, (filename, df) in enumerate(site_dfs):
-      df['global_track_id'] = file_id * 1_000_000 + df['track_id']
-      df['global_frame'] = df['frame'] + frame_offset
-      frame_offset += df['frame'].max() + 1
-  ```
-- **排序**: 按global_frame → global_track_id排序
-- **日志**: 打印文件数、unique frames、unique vehicles
+## 调试脚本（保留在 src 下）
 
-**`detect_gaps_and_split_segments(df: pd.DataFrame, max_gap: int = 1) -> List[Tuple[int, int]]`**
-- **作用**: 检测时间线中的gap并分割成连续段
-- **算法**:
-  ```python
-  gaps = unique_frames[i] - unique_frames[i-1]
-  if gap > max_gap:
-      segments.append((segment_start, prev_frame))
-      segment_start = current_frame
-  ```
-- **返回**: [(start_frame, end_frame), ...] 连续段列表
-- **日志**: 打印segment数量和每个segment的frame范围
+为避免仓库根目录堆积一次性脚本，方向一致性检查已迁移到:
 
-#### Episode提取
-
-**`extract_fixed_stride_episodes(df, segments, episode_length=80, stride=15, ...) -> List[Dict]`**
-- **作用**: 从连续段中提取固定stride的episodes
-- **参数**:
-  - `episode_length` (T=80): 每个episode的帧数
-  - `stride` (S=15): episode起始点间隔
-  - `max_vehicles` (K=50): 最大车辆数
-  - `use_extended_features`: 包含lane/preceding/following
-  - `use_acceleration`: 包含ax, ay
-  - `use_site_id`: 包含site_id特征
-- **算法**:
-  ```python
-  for segment_start, segment_end in segments:
-      frames = range(segment_start, segment_end+1)
-      for start_idx in range(0, len(frames)-episode_length+1, stride):
-          episode_frames = frames[start_idx:start_idx+episode_length]
-          episode = extract_single_episode_from_global(df, episode_frames, ...)
-  ```
-- **返回**: episode列表,每个包含states, masks, scene_id, start_frame, end_frame
-
-**`extract_single_episode_from_global(df, global_frames, max_vehicles, ...) -> Dict`**
-- **作用**: 提取单个episode的tensor数据
-- **核心逻辑**:
-  1. **稳定slot分配**:
-     ```python
-     unique_vehicles = df[df['global_frame'].isin(global_frames)]['global_track_id'].unique()
-     vehicle_counts = episode_data['global_track_id'].value_counts()
-     top_vehicles = vehicle_counts.head(max_vehicles).index
-     vehicle_to_slot = {vid: slot for slot, vid in enumerate(top_vehicles)}
-     ```
-  2. **特征填充**:
-     ```python
-     for t, global_frame in enumerate(global_frames):
-         frame_data = df[df['global_frame'] == global_frame]
-         for row in frame_data:
-             k = vehicle_to_slot[row['global_track_id']]
-             states[t, k, 0:2] = [row['center_x'], row['center_y']]
-             states[t, k, 2:4] = [row['vx'], row['vy']]
-             if use_acceleration:
-                 states[t, k, 4:6] = [row['ax'], row['ay']]
-             states[t, k, 6] = row['angle']
-             states[t, k, 7] = row['class_id']
-             if use_extended_features:
-                 states[t, k, 8] = row['lane_encoded']
-                 states[t, k, 9] = has_preceding
-                 states[t, k, 10] = has_following
-             if use_site_id:
-                 states[t, k, 11] = site_id
-             masks[t, k] = 1.0
-     ```
-- **返回**:
-  ```python
-  {
-      'states': [T, K, F],
-      'masks': [T, K],
-      'scene_id': int,
-      'track_ids': [T, K],
-      'start_frame': int,
-      'end_frame': int
-  }
-  ```
-
-**`get_site_id_from_frames(df: pd.DataFrame, frames: List[int]) -> int`**
-- **作用**: 从'site'列推导数值site_id
-- **转换规则**:
-  - "A" / "Site A" → 0
-  - "B" / "Site B" → 1
-  - ...
-  - "I" / "Site I" → 8
-- **算法**: `ord(site_letter.upper()) - ord('A')`
-- **返回**: 0-8的整数site_id
-
-#### 单站点预处理流程
-
-**`preprocess_single_site_with_global_timeline(csv_files, site_name, ..., frame_range=None, split_name=None) -> Tuple[List[Dict], Dict]`**
-- **作用**: 对单个站点执行完整预处理流程 (适用于chronological split)
-- **参数**:
-  - `frame_range`: `(min_frame, max_frame)` 限制episode提取范围 (用于train/val/test划分)
-  - `split_name`: 'train'/'val'/'test' (用于日志)
-- **流程**:
-  1. 加载所有CSV → `build_global_timeline`
-  2. 计算velocities (基于global_track_id分组)
-  3. 计算accelerations (如果需要)
+- `src/evaluation/debug/gt_direction_consistency.py`
   4. 编码lanes (使用site-specific token: "A:A1")
   5. `detect_gaps_and_split_segments`
   6. **应用frame_range过滤**:

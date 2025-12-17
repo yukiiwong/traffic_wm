@@ -435,8 +435,14 @@ def main():
     # Feature configuration
     parser.add_argument('--use_extended_features', action='store_true', default=True,
                        help='Use extended features (10 instead of 6)')
+    parser.add_argument('--no-use_extended_features', dest='use_extended_features',
+                       action='store_false',
+                       help='Disable extended features (use only 6 basic features)')
     parser.add_argument('--use_acceleration', action='store_true', default=True,
                        help='Include acceleration features')
+    parser.add_argument('--no-use_acceleration', dest='use_acceleration',
+                       action='store_false',
+                       help='Disable acceleration features')
 
     # Episode configuration
     parser.add_argument('--episode_length', type=int, default=80,

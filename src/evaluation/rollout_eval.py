@@ -131,6 +131,59 @@ def _load_stats_or_compute_from_episodes(
     masks = z["masks"]    # [N,T,K]
     m = masks > 0.5
 
+    # Some pipelines keep derived interaction features (e.g., 20..23) virtual and
+    # compute them in the Dataset __getitem__. When computing stats directly from
+    # the raw episodes NPZ, we need to materialize them to avoid out-of-bounds.
+    f_raw = int(states.shape[-1])
+    max_idx = max(continuous_indices) if len(continuous_indices) else -1
+    if max_idx >= f_raw:
+        # Only support the known derived features used by TrajectoryDataset.
+        derived_supported = {20, 21, 22, 23}
+        missing = sorted({i for i in continuous_indices if i >= f_raw})
+        unsupported = [i for i in missing if i not in derived_supported]
+        if unsupported:
+            raise ValueError(
+                f"Cannot compute stats for feature indices {unsupported}: raw episodes have F={f_raw} and "
+                f"only derived indices {sorted(derived_supported)} are supported here."
+            )
+
+        # Create an augmented array and fill raw features.
+        f_aug = max(f_raw, max_idx + 1)
+        states_aug = np.zeros(states.shape[:-1] + (f_aug,), dtype=states.dtype)
+        states_aug[..., :f_raw] = states
+
+        # Compute derived features (assumes the base indices exist in raw states).
+        # 20: velocity_direction from vx=2, vy=3
+        if 20 in missing:
+            vx = states[..., 2]
+            vy = states[..., 3]
+            states_aug[..., 20] = np.arctan2(vy, vx)
+
+        # 21: headway from rel_x_preceding (12)
+        if 21 in missing:
+            states_aug[..., 21] = states[..., 12]
+
+        # 22: ttc derived from rel position and rel_vx (14)
+        if 22 in missing or 23 in missing:
+            rel_x = states[..., 12]
+            rel_y = states[..., 13]
+            rel_vx = states[..., 14]
+            distance = np.sqrt(rel_x ** 2 + rel_y ** 2)
+
+            if 23 in missing:
+                states_aug[..., 23] = distance
+
+            if 22 in missing:
+                # Match TrajectoryDataset._compute_stats(): finite fallback when not approaching.
+                # Avoid np.where warnings by only dividing on the approaching mask.
+                approaching = rel_vx < -0.1
+                ttc = np.full(distance.shape, 100.0, dtype=np.float64)
+                ttc[approaching] = (-distance[approaching] / rel_vx[approaching]).astype(np.float64)
+                ttc = np.clip(ttc / 30.0, 0.0, 100.0)
+                states_aug[..., 22] = ttc.astype(states.dtype, copy=False)
+
+        states = states_aug
+
     mean_list = []
     std_list = []
 

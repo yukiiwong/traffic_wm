@@ -51,11 +51,16 @@ def compute_velocities(df: pd.DataFrame, dt: float = 1.0 / 30.0) -> pd.DataFrame
     """
     df = df.sort_values(['track_id', 'frame']).copy()
 
-    # Compute velocities within each track
-    df['vx'] = df.groupby('track_id')['center_x'].diff() / dt
-    df['vy'] = df.groupby('track_id')['center_y'].diff() / dt
+    # Compute velocities within each track.
+    # IMPORTANT: handle dropouts (non-consecutive frames) by dividing by the actual frame gap.
+    # Otherwise a gap of g frames would inflate velocity by ~g.
+    frame_gap = df.groupby('track_id')['frame'].diff()
+    frame_gap = frame_gap.fillna(0.0).clip(lower=0.0)
+    denom = (frame_gap * dt).replace(0.0, np.nan)
+    df['vx'] = df.groupby('track_id')['center_x'].diff() / denom
+    df['vy'] = df.groupby('track_id')['center_y'].diff() / denom
 
-    # Fill first frame velocities with 0
+    # Fill undefined/first-frame velocities with 0
     df['vx'] = df['vx'].fillna(0.0)
     df['vy'] = df['vy'].fillna(0.0)
 
@@ -75,8 +80,12 @@ def compute_acceleration(df: pd.DataFrame, dt: float = 1.0 / 30.0) -> pd.DataFra
     """
     df = df.sort_values(['track_id', 'frame']).copy()
 
-    df['ax'] = df.groupby('track_id')['vx'].diff() / dt
-    df['ay'] = df.groupby('track_id')['vy'].diff() / dt
+    frame_gap = df.groupby('track_id')['frame'].diff()
+    frame_gap = frame_gap.fillna(0.0).clip(lower=0.0)
+    denom = (frame_gap * dt).replace(0.0, np.nan)
+
+    df['ax'] = df.groupby('track_id')['vx'].diff() / denom
+    df['ay'] = df.groupby('track_id')['vy'].diff() / denom
 
     df['ax'] = df['ax'].fillna(0.0)
     df['ay'] = df['ay'].fillna(0.0)
@@ -791,16 +800,23 @@ def preprocess_single_site_with_global_timeline(
     merged_df = build_global_timeline(site_dfs, fps=fps)
 
     # Step 3: Compute velocities (using global_track_id)
+    # IMPORTANT: account for non-consecutive frames within a track.
     merged_df = merged_df.sort_values(['global_track_id', 'global_frame']).copy()
-    merged_df['vx'] = merged_df.groupby('global_track_id')['center_x'].diff() / dt
-    merged_df['vy'] = merged_df.groupby('global_track_id')['center_y'].diff() / dt
+    frame_gap = merged_df.groupby('global_track_id')['global_frame'].diff()
+    frame_gap = frame_gap.fillna(0.0).clip(lower=0.0)
+    denom = (frame_gap * dt).replace(0.0, np.nan)
+    merged_df['vx'] = merged_df.groupby('global_track_id')['center_x'].diff() / denom
+    merged_df['vy'] = merged_df.groupby('global_track_id')['center_y'].diff() / denom
     merged_df['vx'] = merged_df['vx'].fillna(0.0)
     merged_df['vy'] = merged_df['vy'].fillna(0.0)
 
     # Step 4: Compute acceleration if needed
     if use_acceleration:
-        merged_df['ax'] = merged_df.groupby('global_track_id')['vx'].diff() / dt
-        merged_df['ay'] = merged_df.groupby('global_track_id')['vy'].diff() / dt
+        frame_gap = merged_df.groupby('global_track_id')['global_frame'].diff()
+        frame_gap = frame_gap.fillna(0.0).clip(lower=0.0)
+        denom = (frame_gap * dt).replace(0.0, np.nan)
+        merged_df['ax'] = merged_df.groupby('global_track_id')['vx'].diff() / denom
+        merged_df['ay'] = merged_df.groupby('global_track_id')['vy'].diff() / denom
         merged_df['ax'] = merged_df['ax'].fillna(0.0)
         merged_df['ay'] = merged_df['ay'].fillna(0.0)
 

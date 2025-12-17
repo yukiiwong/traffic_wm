@@ -1,0 +1,14 @@
+{
+  "type": "chronological",
+  "train_ratio": 0.7,
+  "val_ratio": 0.15,
+  "test_ratio": 0.15,
+  "episode_length": 80,
+  "stride": 15,
+  "total_episodes": 6113,
+  "splits": {
+    "train": 4187,
+    "val": 926,
+    "test": 1000
+  }
+}

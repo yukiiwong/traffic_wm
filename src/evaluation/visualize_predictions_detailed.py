@@ -108,6 +108,53 @@ def compute_mean_std_from_episodes_npz(
     masks = z["masks"]    # [N,T,K]
     m = masks > 0.5
 
+    # Some datasets compute derived interaction features (20..23) in __getitem__
+    # and visualization may request stats for indices beyond raw F.
+    f_raw = int(states.shape[-1])
+    max_idx = max(continuous_indices) if len(continuous_indices) else -1
+    if max_idx >= f_raw:
+        derived_supported = {20, 21, 22, 23}
+        missing = sorted({i for i in continuous_indices if i >= f_raw})
+        unsupported = [i for i in missing if i not in derived_supported]
+        if unsupported:
+            raise ValueError(
+                f"Cannot compute stats for feature indices {unsupported}: raw episodes have F={f_raw} and "
+                f"only derived indices {sorted(derived_supported)} are supported here."
+            )
+
+        f_aug = max(f_raw, max_idx + 1)
+        states_aug = np.zeros(states.shape[:-1] + (f_aug,), dtype=states.dtype)
+        states_aug[..., :f_raw] = states
+
+        # 20: velocity_direction from vx=2, vy=3
+        if 20 in missing:
+            vx = states[..., 2]
+            vy = states[..., 3]
+            states_aug[..., 20] = np.arctan2(vy, vx)
+
+        # 21: headway from rel_x_preceding (12)
+        if 21 in missing:
+            states_aug[..., 21] = states[..., 12]
+
+        # 22/23: ttc and preceding_distance derived from relative states
+        if 22 in missing or 23 in missing:
+            rel_x = states[..., 12]
+            rel_y = states[..., 13]
+            rel_vx = states[..., 14]
+            distance = np.sqrt(rel_x ** 2 + rel_y ** 2)
+
+            if 23 in missing:
+                states_aug[..., 23] = distance
+
+            if 22 in missing:
+                approaching = rel_vx < -0.1
+                ttc = np.full(distance.shape, 100.0, dtype=np.float64)
+                ttc[approaching] = (-distance[approaching] / rel_vx[approaching]).astype(np.float64)
+                ttc = np.clip(ttc / 30.0, 0.0, 100.0)
+                states_aug[..., 22] = ttc.astype(states.dtype, copy=False)
+
+        states = states_aug
+
     mean_list, std_list = [], []
     for feat_idx in continuous_indices:
         vals = states[..., feat_idx][m]
@@ -214,6 +261,39 @@ def select_agents_by_presence(gt_mask: torch.Tensor, max_agents: int) -> torch.T
     return idx[:max_agents]
 
 
+def select_agents_random(
+    gt_mask: torch.Tensor,  # [H,K]
+    max_agents: int,
+    seed: int,
+) -> torch.Tensor:
+    """Select agents uniformly at random from agents present at least once in horizon."""
+    valid_ids = torch.where(gt_mask.sum(0) > 0)[0]
+    if valid_ids.numel() == 0:
+        # Fallback: just take first indices.
+        return torch.arange(min(max_agents, gt_mask.shape[1]), device=gt_mask.device)
+    g = torch.Generator(device=gt_mask.device)
+    g.manual_seed(int(seed))
+    perm = torch.randperm(valid_ids.numel(), generator=g, device=gt_mask.device)
+    chosen = valid_ids[perm[: min(max_agents, valid_ids.numel())]]
+    return chosen
+
+
+def select_agents_by_ade(
+    gt_xy: torch.Tensor,      # [H,K,2]
+    pred_xy: torch.Tensor,    # [H,K,2]
+    gt_mask: torch.Tensor,    # [H,K]
+    max_agents: int,
+    descending: bool,
+) -> torch.Tensor:
+    """Select agents by ADE ordering (descending=True shows worst errors)."""
+    err = ((pred_xy - gt_xy) ** 2).sum(-1).sqrt()  # [H,K]
+    err = err * gt_mask
+    ade = err.sum(0) / (gt_mask.sum(0) + 1e-6)     # [K]
+    ade = torch.where(gt_mask.sum(0) > 0, ade, torch.full_like(ade, -1e9 if descending else 1e9))
+    idx = torch.argsort(ade, descending=bool(descending))
+    return idx[:max_agents]
+
+
 def _clip_roi(xmin, ymin, xmax, ymax, W, H):
     xmin = max(0, min(W - 1, xmin))
     xmax = max(0, min(W - 1, xmax))
@@ -253,10 +333,19 @@ def draw_traj(ax, traj_xy: np.ndarray, color: str, lw: float = 2.2, alpha: float
     x = traj_xy[:, 0]
     y = traj_xy[:, 1]
     ax.plot(x, y, color=color, linewidth=lw, alpha=alpha)
-    ax.scatter([x[0]], [y[0]], s=18, color=color, alpha=alpha, marker="o")
-    ax.scatter([x[-1]], [y[-1]], s=22, color=color, alpha=alpha, marker="s")
+
+    valid = np.isfinite(x) & np.isfinite(y)
+    if valid.sum() < 1:
+        return
+    first = int(np.argmax(valid))
+    last = int(np.where(valid)[0][-1])
+    ax.scatter([x[first]], [y[first]], s=18, color=color, alpha=alpha, marker="o")
+    ax.scatter([x[last]], [y[last]], s=22, color=color, alpha=alpha, marker="s")
+
     if arrows_every and traj_xy.shape[0] > 2:
         for t in range(0, traj_xy.shape[0] - 1, arrows_every):
+            if not (valid[t] and valid[t + 1]):
+                continue
             dx = x[t + 1] - x[t]
             dy = y[t + 1] - y[t]
             ax.arrow(
@@ -268,11 +357,22 @@ def draw_traj(ax, traj_xy: np.ndarray, color: str, lw: float = 2.2, alpha: float
             )
 
 
+def apply_nan_breaks(traj_xy: np.ndarray, mask: Optional[np.ndarray]) -> np.ndarray:
+    """Break polylines on mask gaps by inserting NaNs (matplotlib breaks at NaNs)."""
+    if mask is None:
+        return traj_xy
+    out = traj_xy.astype(np.float32, copy=True)
+    m = mask > 0.5
+    out[~m, :] = np.nan
+    return out
+
+
 def draw_agents(
     ax,
     ctx_xy: np.ndarray,      # [C,A,2]
     gt_xy: np.ndarray,       # [H,A,2]
     pred_xy: np.ndarray,     # [H,A,2]
+    ctx_mask: Optional[np.ndarray],  # [C,A]
     gt_mask: np.ndarray,     # [H,A]
     pred_mask: Optional[np.ndarray],
     mode: str,
@@ -289,21 +389,16 @@ def draw_agents(
 
     for a in range(A):
         if mode in ("ctx_gt", "ctx_pred"):
-            draw_traj(ax, ctx_xy[:, a, :], color="tab:blue", arrows_every=arrows_every)
+            draw_traj(ax, apply_nan_breaks(ctx_xy[:, a, :], None if ctx_mask is None else ctx_mask[:, a]), color="tab:blue", arrows_every=arrows_every)
 
-        # GT masked
-        m = gt_mask[:, a] > 0.5
-        gt_traj = gt_xy[m, a, :] if m.any() else gt_xy[:, a, :]
+        # GT masked (break on gaps)
+        gt_traj = apply_nan_breaks(gt_xy[:, a, :], gt_mask[:, a])
         if mode in ("ctx_gt", "cmp"):
             draw_traj(ax, gt_traj, color="tab:green", arrows_every=arrows_every)
 
         # Pred masked (optional)
         if mode in ("ctx_pred", "cmp"):
-            if pred_mask is not None:
-                pm = pred_mask[:, a] > 0.5
-                pred_traj = pred_xy[pm, a, :] if pm.any() else pred_xy[:, a, :]
-            else:
-                pred_traj = pred_xy[:, a, :]
+            pred_traj = apply_nan_breaks(pred_xy[:, a, :], None if pred_mask is None else pred_mask[:, a])
             draw_traj(ax, pred_traj, color="tab:red", arrows_every=arrows_every)
 
 
@@ -312,6 +407,7 @@ def make_triple_panel_figure(
     ctx_xy: np.ndarray,      # [C,A,2]
     gt_xy: np.ndarray,       # [H,A,2]
     pred_xy: np.ndarray,     # [H,A,2]
+    ctx_mask: Optional[np.ndarray],  # [C,A]
     gt_mask: np.ndarray,     # [H,A]
     pred_mask: Optional[np.ndarray],
     zoom_roi: Tuple[int, int, int, int],
@@ -324,13 +420,13 @@ def make_triple_panel_figure(
     for ax in axes:
         draw_background(ax, background_img)
 
-    draw_agents(ax_gt, ctx_xy, gt_xy, pred_xy, gt_mask, pred_mask, mode="ctx_gt", arrows_every=arrows_every)
+    draw_agents(ax_gt, ctx_xy, gt_xy, pred_xy, ctx_mask, gt_mask, pred_mask, mode="ctx_gt", arrows_every=arrows_every)
     ax_gt.set_title("Context + Ground Truth", fontsize=12)
 
-    draw_agents(ax_pred, ctx_xy, gt_xy, pred_xy, gt_mask, pred_mask, mode="ctx_pred", arrows_every=arrows_every)
+    draw_agents(ax_pred, ctx_xy, gt_xy, pred_xy, ctx_mask, gt_mask, pred_mask, mode="ctx_pred", arrows_every=arrows_every)
     ax_pred.set_title("Context + Prediction", fontsize=12)
 
-    draw_agents(ax_cmp, ctx_xy, gt_xy, pred_xy, gt_mask, pred_mask, mode="cmp", arrows_every=arrows_every)
+    draw_agents(ax_cmp, ctx_xy, gt_xy, pred_xy, ctx_mask, gt_mask, pred_mask, mode="cmp", arrows_every=arrows_every)
     ax_cmp.set_title("GT vs Prediction", fontsize=12)
 
     xmin, ymin, xmax, ymax = zoom_roi
@@ -342,7 +438,7 @@ def make_triple_panel_figure(
     draw_background(axins, background_img)
     axins.set_xlim(xmin, xmax)
     axins.set_ylim(ymax, ymin)
-    draw_agents(axins, ctx_xy, gt_xy, pred_xy, gt_mask, pred_mask, mode="cmp", arrows_every=arrows_every)
+    draw_agents(axins, ctx_xy, gt_xy, pred_xy, ctx_mask, gt_mask, pred_mask, mode="cmp", arrows_every=arrows_every)
     axins.set_title("Zoom-in", fontsize=10)
 
     if title:
@@ -370,8 +466,16 @@ def main():
         "--select_agents", 
         type=str, 
         default="error", 
-        choices=["error", "presence"],
-        help="Agent selection mode: 'error'=highest ADE (show failures), 'presence'=longest duration (show complete trajectories)"
+        choices=["error", "best_error", "median_error", "presence", "random", "first"],
+        help=(
+            "Agent selection mode: "
+            "'error'=highest ADE (worst cases), "
+            "'best_error'=lowest ADE (best cases), "
+            "'median_error'=middle ADE (more typical), "
+            "'presence'=longest duration, "
+            "'random'=uniform random among present agents, "
+            "'first'=first max_agents by index"
+        )
     )
     parser.add_argument("--zoom_margin_px", type=int, default=60)
     parser.add_argument("--arrows_every", type=int, default=0, help="Draw direction arrows every N steps (0 disables).")
@@ -484,15 +588,34 @@ def main():
     model.load_state_dict(state_dict)
     model = model.to(device)
     model.eval()
+
+    # Keep rollout behavior consistent with train-time config (if present)
+    if bool(model_config.get("rollout_prior_velocity_from_positions", False)):
+        model.rollout_prior_velocity_from_positions = True
     print(f"Model loaded: input_dim={input_dim}, continuous_dim={continuous_dim}, max_agents={model_max_agents}")
     print(f"  Architecture: latent_dim={latent_dim}, dynamics_layers={dynamics_layers}, dynamics_heads={dynamics_heads}")
     print(f"Embeddings: num_lanes={num_lanes}, num_sites={num_sites}, num_classes={num_classes}")
 
 
-    # On-the-fly stats from train_episodes.npz (same folder)
-    train_npz = str(Path(args.test_data).parent / "train_episodes.npz")
-    print(f"Computing mean/std from: {train_npz}")
-    mean_cont, std_cont = compute_mean_std_from_episodes_npz(train_npz, continuous_indices)
+    # Prefer using train-time normalization stats/indices if present next to checkpoint.
+    stats_npz = Path(args.checkpoint).parent / "normalization_stats.npz"
+    mean_cont = None
+    std_cont = None
+    if stats_npz.exists():
+        zstats = np.load(str(stats_npz))
+        if {"mean", "std", "continuous_indices", "discrete_indices"}.issubset(set(zstats.files)):
+            mean_cont = torch.from_numpy(zstats["mean"]).float()
+            std_cont = torch.from_numpy(zstats["std"]).float().clamp(min=1e-6)
+            continuous_indices = [int(x) for x in zstats["continuous_indices"].tolist()]
+            discrete_indices = [int(x) for x in zstats["discrete_indices"].tolist()]
+            print(f"Loaded mean/std + indices from: {stats_npz}")
+        else:
+            print(f"Warning: {stats_npz} missing expected keys; falling back to on-the-fly stats.")
+
+    if mean_cont is None or std_cont is None:
+        train_npz = str(Path(args.test_data).parent / "train_episodes.npz")
+        print(f"Computing mean/std from: {train_npz}")
+        mean_cont, std_cont = compute_mean_std_from_episodes_npz(train_npz, continuous_indices)
     mean_cont_d = mean_cont.to(device)
     std_cont_d = std_cont.to(device)
 
@@ -570,12 +693,39 @@ def main():
 
         # agent selection
         if args.select_agents == "error":
-            agent_idx = select_agents_by_error(gt_xy, pred_xy, gt_future_masks, args.max_agents)
+            agent_idx = select_agents_by_ade(gt_xy, pred_xy, gt_future_masks, args.max_agents, descending=True)
+        elif args.select_agents == "best_error":
+            agent_idx = select_agents_by_ade(gt_xy, pred_xy, gt_future_masks, args.max_agents, descending=False)
+        elif args.select_agents == "median_error":
+            # Sort by ADE ascending then take a middle slice.
+            err = ((pred_xy - gt_xy) ** 2).sum(-1).sqrt()  # [H,K]
+            err = err * gt_future_masks
+            ade = err.sum(0) / (gt_future_masks.sum(0) + 1e-6)
+            present = gt_future_masks.sum(0) > 0
+            ade = torch.where(present, ade, torch.full_like(ade, 1e9))
+            order = torch.argsort(ade, descending=False)
+            valid_order = order[present[order]]
+            if valid_order.numel() == 0:
+                agent_idx = torch.arange(min(args.max_agents, K), device=device)
+            else:
+                mid = int(valid_order.numel() // 2)
+                agent_idx = valid_order[mid : mid + min(args.max_agents, valid_order.numel() - mid)]
+                if agent_idx.numel() < min(args.max_agents, valid_order.numel()):
+                    # Wrap around if not enough.
+                    remaining = min(args.max_agents, valid_order.numel()) - agent_idx.numel()
+                    agent_idx = torch.cat([agent_idx, valid_order[:remaining]], dim=0)
+        elif args.select_agents == "presence":
+            agent_idx = select_agents_by_presence(gt_future_masks, args.max_agents)
+        elif args.select_agents == "random":
+            agent_idx = select_agents_random(gt_future_masks, args.max_agents, seed=args.seed + int(ds_idx))
+        elif args.select_agents == "first":
+            agent_idx = torch.arange(min(args.max_agents, K), device=device)
         else:
             agent_idx = select_agents_by_presence(gt_future_masks, args.max_agents)
 
         # gather
         ctx_xy_a = ctx_xy[:, agent_idx].detach().cpu().numpy()          # [C,A,2]
+        ctx_mask_a = ctx_masks[:, agent_idx].detach().cpu().numpy()     # [C,A]
         gt_xy_a = gt_xy[:, agent_idx].detach().cpu().numpy()            # [H,A,2]
         pred_xy_a = pred_xy[:, agent_idx].detach().cpu().numpy()        # [H,A,2]
         gt_mask_a = gt_future_masks[:, agent_idx].detach().cpu().numpy()    # [H,A]
@@ -595,6 +745,7 @@ def main():
             ctx_xy=ctx_xy_a,
             gt_xy=gt_xy_a,
             pred_xy=pred_xy_a,
+            ctx_mask=ctx_mask_a,
             gt_mask=gt_mask_a,
             pred_mask=pred_mask_a,
             zoom_roi=zoom_roi,
